@@ -1,0 +1,27 @@
+[build-system]
+requires = ["setuptools>=68"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "winpe-image-deployer"
+version = "0.2.1"
+description = "A Windows PE GUI utility for capturing, servicing, and deploying Windows WIM images."
+requires-python = "==3.12.*"
+license = { text = "MIT" }
+
+[project.scripts]
+winpe-image-deployer = "winpe_deploy.main:main"
+
+[tool.setuptools]
+package-dir = { "" = "src" }
+
+[tool.setuptools.packages.find]
+where = ["src"]
+
+[tool.coverage.run]
+branch = true
+source = ["winpe_deploy"]
+
+[tool.coverage.report]
+show_missing = true
+fail_under = 75

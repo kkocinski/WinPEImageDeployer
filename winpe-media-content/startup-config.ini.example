@@ -1,0 +1,39 @@
+; Rename this file to startup-config.ini after entering the required values.
+; Every section is optional. Delete an entire section to skip that action.
+; The SMB password is intentionally plaintext: keep boot media physically secure.
+
+[ethernet]
+; Select by adapter name OR MAC. Leave the other empty; if both are set they must match.
+; The name must exactly match the name in the application's Network tab.
+adapter = Ethernet
+; Example: AA-BB-CC-01-02-FF (colons are also accepted). To select by MAC, clear adapter above.
+mac =
+address = 192.168.1.20
+mask = 255.255.255.0
+; gateway and dns are optional. Multiple DNS servers are comma-separated.
+gateway = 192.168.1.1
+dns = 192.168.1.1, 1.1.1.1
+
+[share]
+drive_letter = Z:
+unc_path = \\server\deployment
+username = DOMAIN\deploy
+password = replace-with-password
+
+; Disabled by default. Delete this section if automatic deployment is not required.
+; When enabled, WinPE deploys only if exactly one eligible disk remains after
+; protecting the boot/configuration media and a local WIM disk.
+; WARNING: The entire selected physical disk is erased, including any D: partition.
+; Intended for one Windows installation per target disk; UEFI creates EFI/MSR too.
+; Disk-to-disk and partition-to-partition copying are not supported yet.
+[auto_deploy]
+enabled = false
+wim_path = Z:\Images\Windows11.wim
+image_index = 1
+firmware = UEFI (GPT)
+minimum_disk_size_gib = 100
+; Optional upper limit in GiB (inclusive); empty means no upper limit.
+; For a 1 TB and a 4 TB disk, 1100 includes the 1 TB disk and excludes the 4 TB disk.
+maximum_disk_size_gib =
+; Optional. A non-empty serial requires PowerShell disk metadata in WinPE.
+expected_disk_serial =
