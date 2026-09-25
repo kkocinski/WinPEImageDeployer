@@ -2,6 +2,10 @@
 
 WinPE Image Deployer 0.2.1 is a Python 3.12 Tkinter application for capturing, servicing, storing, and deploying Windows images in Windows PE. It uses native Windows tools: **DISM**, **DiskPart**, **BCDBoot**, **netsh**, and **net use**.
 
+## How this project was created
+
+According to the project initiator, **ChatGPT 5.6 Terra and ChatGPT 6 Sol generated this project's code and documentation** from the initiator's prompts and directions. The initiator specified what to build and guided the work, but did not write the code. This attribution uses the model names provided by the initiator; individual contributions by each model have not been independently verified.
+
 > **Project status — unstable, under active development.** Version 0.2.1 is published as source code for review and further development, **not as a production-ready release**. Unit tests use mocked operating-system commands; they do not verify real disk operations, WinPE startup, or UEFI boot behavior. A complete end-to-end test of this version on representative physical WinPE hardware is **not documented in this repository**. Do not assume that publishing the repository means these workflows have passed hardware validation. Test in a VM and on disposable hardware before considering any real deployment.
 
 > **Warning**: Deployment permanently erases the selected target disk. Review the disk number, model, and size before confirming an operation.
