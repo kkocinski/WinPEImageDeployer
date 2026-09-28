@@ -175,23 +175,80 @@ class DeploymentServiceTests(unittest.TestCase):
             self.assertTrue(any("/Mount-Image" in command for command in commands))
             self.assertTrue(any("/Commit" in command for command in commands))
 
-    def test_list_disks_prefers_diskpart_in_winpe(self) -> None:
-        service = DeploymentService(FakeRunner(["  Disk 0    Online          476 GB      32 GB\n"]), logging.getLogger("test"))
+    def test_list_disks_falls_back_to_diskpart_when_powershell_unavailable(self) -> None:
+        runner = FakeRunner(["", "  Disk 0    Online          476 GB      32 GB\n"])
+        service = DeploymentService(runner, logging.getLogger("test"))
         result = service.list_disks()
         self.assertEqual(1, len(result))
         self.assertEqual(0, result[0].number)
         self.assertEqual("Physical disk (DiskPart)", result[0].model)
         self.assertEqual(476 * 1024**3, result[0].size_bytes)
         self.assertEqual(32 * 1024**3, result[0].unallocated_bytes)
+        self.assertEqual(["powershell.exe", "diskpart.exe"], [command[0][0] for command in runner.commands])
 
-    def test_list_disks_uses_powershell_only_when_diskpart_returns_no_disks(self) -> None:
-        disks = [{"Number": 0, "FriendlyName": "NVMe", "BusType": "NVMe", "SerialNumber": "SN-1", "Size": 512110190592, "VolumeSize": 500000000000, "VolumeFree": 200000000000, "Unallocated": 12110190592}]
-        service = DeploymentService(FakeRunner(["", json.dumps(disks)]), logging.getLogger("test"))
+    def test_list_disks_fallback_accepts_localized_diskpart_rows_and_bytes(self) -> None:
+        runner = FakeRunner(["", "  Dysk 0    Online          476 GB      0 B\n  Dysk 2    Online          58,5 GB      512 MB\n"])
+        disks = DeploymentService(runner, logging.getLogger("test")).list_disks()
+        self.assertEqual([0, 2], [disk.number for disk in disks])
+        self.assertEqual(0, disks[0].unallocated_bytes)
+        self.assertEqual(int(58.5 * 1024**3), disks[1].size_bytes)
+        self.assertEqual(512 * 1024**2, disks[1].unallocated_bytes)
+
+    def test_list_disks_prefers_powershell_identity_and_multiple_partition_letters(self) -> None:
+        disks = [{"Number": 0, "FriendlyName": "NVMe", "BusType": "NVMe", "SerialNumber": "SN-1", "Size": 512110190592, "VolumeSize": 500000000000, "VolumeFree": 200000000000, "Unallocated": 12110190592, "Partitions": [{"Number": 1, "Letter": "D:"}, {"Number": 3, "Letter": "R:"}]}]
+        runner = FakeRunner([json.dumps(disks)])
+        service = DeploymentService(runner, logging.getLogger("test"))
         result = service.list_disks()
         self.assertEqual(1, len(result))
         self.assertEqual("NVMe", result[0].model)
         self.assertEqual("NVMe", result[0].bus_type)
         self.assertEqual("SN-1", result[0].serial_number)
+        self.assertEqual(((1, "D:"), (3, "R:")), result[0].partition_letters)
+        self.assertEqual(1, len(runner.commands))
+        self.assertIn("P1=D:", result[0].display_name())
+        self.assertIn("P3=R:", result[0].display_name())
+
+    def test_list_disks_accepts_single_powershell_disk_object_and_missing_partitions(self) -> None:
+        disk = {"Number": 2, "FriendlyName": "USB", "BusType": "USB", "SerialNumber": "FLASH", "Size": 64000000000, "Partitions": []}
+        service = DeploymentService(FakeRunner([json.dumps(disk)]), logging.getLogger("test"))
+        self.assertEqual((), service.list_disks()[0].partition_letters)
+
+    def test_list_disks_preserves_partition_letters_on_each_physical_disk(self) -> None:
+        disks = [
+            {"Number": 1, "FriendlyName": "USB", "BusType": "USB", "Size": 64000000000,
+             "Partitions": [{"Number": 3, "Letter": "R:"}, {"Number": 1, "Letter": "D:"}]},
+            {"Number": 4, "FriendlyName": "SSD", "BusType": "NVMe", "Size": 512000000000,
+             "Partitions": [{"Number": 2, "Letter": "C:"}]},
+        ]
+        runner = FakeRunner([json.dumps(disks)])
+        result = DeploymentService(runner, logging.getLogger("test")).list_disks()
+        self.assertEqual([(1, ((1, "D:"), (3, "R:"))), (4, ((2, "C:"),))],
+                         [(disk.number, disk.partition_letters) for disk in result])
+        self.assertIn("Get-Partition -DiskNumber $disk.Number", runner.commands[0][0][-1])
+
+    def test_invalid_powershell_disk_metadata_uses_diskpart_fallback(self) -> None:
+        for payload in ('"unexpected"', '[{"Number":0,"Size":0}]',
+                        '[{"Number":0,"Size":100},{"Number":0,"Size":200}]',
+                         '[{"Number":0,"Size":100,"Partitions":[{"Number":1,"Letter":"??"}]}]',
+                         '[{"Number":0,"Size":100,"Partitions":[{"Number":1,"Letter":"D:"},{"Number":1,"Letter":"R:"}]}]'):
+            with self.subTest(payload=payload):
+                runner = FakeRunner([payload, "  Disk 2    Online          476 GB      32 GB\n"])
+                result = DeploymentService(runner, logging.getLogger("test")).list_disks()
+                self.assertEqual([(2, "Physical disk (DiskPart)")], [(disk.number, disk.model) for disk in result])
+
+    def test_duplicate_drive_letter_on_two_disks_falls_back_without_claiming_identity(self) -> None:
+        disks = [
+            {"Number": 0, "Size": 100000, "Partitions": [{"Number": 1, "Letter": "R:"}]},
+            {"Number": 1, "Size": 200000, "Partitions": [{"Number": 2, "Letter": "R:"}]},
+        ]
+        runner = FakeRunner([json.dumps(disks), "  Disk 2    Online          476 GB      0 B\n"])
+        result = DeploymentService(runner, logging.getLogger("test")).list_disks()
+        self.assertEqual([(2, ())], [(disk.number, disk.partition_letters) for disk in result])
+
+    def test_powershell_disk_metadata_accepts_utf8_bom(self) -> None:
+        runner = FakeRunner(['\ufeff{"Number":2,"Size":64000000000,"Partitions":[{"Number":1,"Letter":"E:"}]}'])
+        result = DeploymentService(runner, logging.getLogger("test")).list_disks()
+        self.assertEqual(((1, "E:"),), result[0].partition_letters)
 
     def test_disk_number_for_drive_uses_partition_metadata(self) -> None:
         service = DeploymentService(FakeRunner(["4\r\n"]), logging.getLogger("test"))
@@ -573,6 +630,67 @@ class NetworkServiceTests(unittest.TestCase):
         self.assertIn("s3cret", command)
         self.assertEqual(("s3cret",), secrets)
         self.assertEqual({}, environment)
+
+    def test_connect_unc_share_uses_no_drive_letter_and_redacts_password(self) -> None:
+        runner = FakeRunner()
+        service = NetworkService(runner)
+        service.connect_unc_share("\\\\server\\images", "DOMAIN\\tech", "s3cret")
+        command, secrets, environment = runner.commands[0]
+        self.assertEqual(("net.exe", "use", "\\\\server\\images", "s3cret", "/user:DOMAIN\\tech", "/persistent:no"), command)
+        self.assertEqual(("s3cret",), secrets)
+        with self.assertRaises(ValueError):
+            service.connect_unc_share("\\\\server\\images\\folder", "tech", "secret")
+
+    def test_disk_mapping_uses_serial_and_explicit_partition_numbers_without_diskpart_clean(self) -> None:
+        runner = FakeRunner()
+        DeploymentService(runner, logging.getLogger("test_disk_mapping")).map_disk_partitions_by_serial(
+            "SERIAL-123", ((1, "R:"), (3, "S:")),
+        )
+        command = runner.commands[0][0]
+        self.assertEqual("powershell.exe", command[0])
+        self.assertIn("([string]$_.SerialNumber).Trim() -eq 'SERIAL-123'", command[-1])
+        self.assertIn("$partitions[[string][int]$entry[0]]", command[-1])
+        self.assertIn("Add-PartitionAccessPath", command[-1])
+        self.assertNotIn("Set-Partition", command[-1])
+        self.assertNotIn("Clear-Disk", command[-1])
+        self.assertNotIn("Format-", command[-1])
+        self.assertIn("$used = @(Get-Partition", command[-1])
+        self.assertIn("non-target partition", command[-1])
+        self.assertIn("$partition.DriveLetter", command[-1])
+        self.assertIn('[[1, "R"], [3, "S"]]', command[-1])
+        self.assertIn("AccessPath", command[-1])
+        self.assertIn("-ErrorAction Stop", command[-1])
+
+    def test_command_runner_redacts_secret_in_native_output_and_error(self) -> None:
+        import logging
+        from types import SimpleNamespace
+
+        logger = logging.getLogger("test_secret_native_output")
+        with self.assertLogs(logger, level="INFO") as captured, mock.patch(
+            "winpe_deploy.command_runner.subprocess.run",
+            return_value=SimpleNamespace(stdout="s3cret in stdout", stderr="s3cret in stderr", returncode=1),
+        ):
+            with self.assertRaises(CommandExecutionError) as error:
+                CommandRunner(logger).run(["net.exe", "use", "s3cret"], secrets=("s3cret",))
+        self.assertNotIn("s3cret", "\n".join(captured.output) + str(error.exception))
+
+    def test_auto_deploy_unc_requires_credentials_and_complete_share(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            path = Path(temporary) / "startup-config.ini"
+            base = "[auto_deploy]\nenabled = true\nimage_index = 1\nfirmware = UEFI (GPT)\nminimum_disk_size_gib = 100\n"
+            for wim, extra in (
+                ("\\\\server\\images\\base.wim", ""),
+                ("\\\\server\\images.wim", "username = tech\npassword = secret\n"),
+                ("\\\\server\\images\\..\\base.wim", "username = tech\npassword = secret\n"),
+                ("Z:\\base.wim", "username = tech\npassword = secret\n"),
+            ):
+                with self.subTest(wim=wim):
+                    path.write_text(base + f"wim_path = {wim}\n" + extra, encoding="utf-8")
+                    with self.assertRaises(ValueError):
+                        load_startup_config(path)
+            path.write_text(base + "wim_path = \\\\server\\images\\base.wim\nusername = tech\npassword = secret\n", encoding="utf-8")
+            config = load_startup_config(path)
+            self.assertEqual("tech", config.auto_deploy.username)
 
     def test_configure_ipv4_adds_each_dns_server(self) -> None:
         runner = FakeRunner()

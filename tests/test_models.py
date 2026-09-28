@@ -69,6 +69,10 @@ class ModelValidationTests(unittest.TestCase):
         self.assertIn("20.0 GiB free", display)
         self.assertIn("10.0 GiB", display)
 
+    def test_disk_display_labels_letters_by_partition_number(self) -> None:
+        disk = DiskInfo(1, "USB images", 64 * 1024**3, partition_letters=((1, "D:"), (3, "R:")))
+        self.assertIn("Partitions: P1=D:, P3=R:", disk.display_name())
+
     def test_directory_picker_lists_only_sorted_subdirectories(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:
             root = Path(temporary)

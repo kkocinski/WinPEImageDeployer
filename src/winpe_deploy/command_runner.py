@@ -44,12 +44,12 @@ class CommandRunner:
 
         result = CommandResult(command_tuple, completed.stdout, completed.stderr, completed.returncode)
         if result.stdout.strip():
-            self._logger.info("Output from %s:\n%s", command_tuple[0], result.stdout.strip())
+            self._logger.info("Output from %s:\n%s", command_tuple[0], self._redact((result.stdout.strip(),), secrets))
         if result.stderr.strip():
-            self._logger.warning("Error output from %s:\n%s", command_tuple[0], result.stderr.strip())
+            self._logger.warning("Error output from %s:\n%s", command_tuple[0], self._redact((result.stderr.strip(),), secrets))
         if result.return_code != 0:
             message = result.stderr.strip() or result.stdout.strip() or "No diagnostic output was returned."
-            raise CommandExecutionError(f"{command_tuple[0]} failed with exit code {result.return_code}: {message}")
+            raise CommandExecutionError(f"{command_tuple[0]} failed with exit code {result.return_code}: {self._redact((message,), secrets)}")
         return result
 
     def run_streaming(

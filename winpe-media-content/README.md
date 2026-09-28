@@ -31,7 +31,7 @@ At WinPE startup, the application recursively finds and loads every `.inf` below
 ## Startup configuration
 
 1. Copy or rename `startup-config.ini.example` to `startup-config.ini`.
-2. Edit the settings for Ethernet, optional SMB mapping, and optional auto-deploy. Ethernet and SMB mapping complete before automatic deployment or the GUI; SMB mapping retries up to 6 times at 5-second intervals.
+2. Edit the settings for Ethernet, optional physical-disk partition letter mapping, optional SMB mapping, and optional auto-deploy. Startup actions complete before automatic deployment or the GUI; SMB connection retries up to 6 times at 5-second intervals.
 3. Keep `[auto_deploy]` disabled until the target hardware layout has been validated.
 
 The public repository includes only the example; any local active `startup-config.ini` is ignored by Git. It may contain a plaintext SMB password and may enable disk erasure. Review it before building boot media; never commit it or vendor drivers without permission.
@@ -41,6 +41,10 @@ With `enabled = true`, automatic deployment restarts WinPE after successful depl
 ## Text Editor
 
 The **Text Editor** tab can open, edit, save, and save-as text files stored on local WinPE media. Use **Open startup-config.ini** when exactly one active startup configuration is present. Changes to `startup-config.ini` are saved immediately, but require a WinPE restart before pre-GUI drivers, Ethernet, and SMB startup actions use the new settings.
+
+## Stable physical disk partition letters
+
+Optional `[disk_mapping]` selects one physical disk by exact serial number and assigns letters to explicitly numbered partitions, for example `partition_1 = R:` and `partition_2 = S:`. A disk may have any number of partitions; only listed ones are changed. This does not create, format, clean, or delete partitions. Ambiguous/missing serials, missing partitions, occupied letters, or overwriting the startup-media letter fail closed. PowerShell Storage cmdlets are required. Configure this before using a mapped local WIM path in `[auto_deploy]`.
 
 ## Automatic deployment behavior
 

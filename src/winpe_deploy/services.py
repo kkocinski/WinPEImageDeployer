@@ -32,12 +32,12 @@ class DeploymentService:
         self._logger = logger
 
     def list_disks(self) -> list[DiskInfo]:
-        """Use DiskPart first because it is present and reliable in minimal WinPE."""
-        disks = self._list_disks_with_diskpart()
+        """Prefer physical identity and partition letters; retain DiskPart for minimal WinPE."""
+        disks = self._list_disks_with_powershell()
         if disks:
             return disks
-        self._logger.warning("DiskPart returned no disks; trying PowerShell Storage cmdlets as a fallback.")
-        return self._list_disks_with_powershell()
+        self._logger.warning("PowerShell disk metadata unavailable; DiskPart fallback cannot show disk identity or partition letters.")
+        return self._list_disks_with_diskpart()
 
     def list_disks_for_auto_deploy(self) -> list[DiskInfo]:
         """Require rich bus/serial metadata; automatic clean must never guess."""
@@ -78,6 +78,49 @@ class DeploymentService:
             raise RuntimeError(f"Could not resolve {drive} to a physical disk number.") from error
         raise RuntimeError(f"Could not resolve {drive} to a physical disk number using PowerShell or DiskPart.")
 
+    def map_disk_partitions_by_serial(self, serial_number: str, mappings: tuple[tuple[int, str], ...]) -> None:
+        """Assign requested letters to partitions of exactly one serial-matched disk."""
+        serial = serial_number.strip().replace("'", "''")
+        if not serial or not mappings:
+            raise ValueError("A physical disk serial and at least one partition mapping are required.")
+        if any(number < 1 or not re.fullmatch(r"[A-Z]:", letter) for number, letter in mappings):
+            raise ValueError("Partition numbers and drive letters must be valid before mapping.")
+        if len({number for number, _ in mappings}) != len(mappings):
+            raise ValueError("Each partition may be mapped only once.")
+        if len({letter for _, letter in mappings}) != len(mappings):
+            raise ValueError("Each requested drive letter must be unique.")
+        encoded = json.dumps([[number, letter[0]] for number, letter in mappings])
+        script = (
+            "$ErrorActionPreference='Stop'; "
+            "$diskMatches = @(Get-Disk | Where-Object { ([string]$_.SerialNumber).Trim() -eq '" + serial + "' }); "
+            "if ($diskMatches.Count -ne 1) { throw 'Disk serial did not identify exactly one disk.' }; "
+            "$diskNumber = [int]$diskMatches[0].Number; "
+            "$mapping = @(ConvertFrom-Json -InputObject '" + encoded + "'); "
+            "$partitions = @{}; $targetPartitions = @{}; $targetLetters = @{}; "
+            "foreach ($entry in $mapping) { "
+            "$partitionNumber = [int]$entry[0]; $letter = ([string]$entry[1]).ToUpperInvariant(); "
+            "$partitionMatches = @(Get-Partition -DiskNumber $diskNumber -PartitionNumber $partitionNumber -ErrorAction Stop); "
+            "if ($partitionMatches.Count -ne 1) { throw ('Partition ' + $partitionNumber + ' did not resolve uniquely.') }; "
+            "$partition = $partitionMatches[0]; $partitions[[string]$partitionNumber] = $partition; "
+            "$targetPartitions[($diskNumber.ToString() + ':' + $partitionNumber.ToString())] = $true; "
+            "$targetLetters[$letter] = $true; "
+            "if ($partition.DriveLetter -and $partition.DriveLetter.ToString().ToUpperInvariant() -ne $letter) { "
+            "throw ('Partition ' + $partitionNumber + ' already has a different drive letter.') }; "
+            "}; "
+            "foreach ($entry in $mapping) { $partition = $partitions[[string][int]$entry[0]]; "
+            "$letter = ([string]$entry[1]).ToUpperInvariant(); "
+            "$used = @(Get-Partition | Where-Object { $_.DriveLetter -and $_.DriveLetter.ToString().ToUpperInvariant() -eq $letter }); "
+            "foreach ($volume in $used) { $key = ([int]$volume.DiskNumber).ToString() + ':' + ([int]$volume.PartitionNumber).ToString(); "
+            "if (-not $targetPartitions.ContainsKey($key) -or -not $targetLetters.ContainsKey($letter)) { "
+            "throw ('Drive letter ' + $letter + ' is already used by a non-target partition.') } } "
+            "}; "
+            "foreach ($entry in $mapping) { $partition = $partitions[[string][int]$entry[0]]; "
+            "if (-not $partition.DriveLetter) { Add-PartitionAccessPath -InputObject $partition "
+            "-AccessPath (([string]$entry[1]).ToUpperInvariant() + ':\') -ErrorAction Stop } }; "
+            "'Drive mapping completed.'"
+        )
+        self._runner.run(["powershell.exe", "-NoProfile", "-NonInteractive", "-Command", script])
+
     def single_disk_number_for_drive(self, drive_letter: str) -> int:
         """Lock mapping: require DiskPart to report exactly one physical extent."""
         drive = normalize_drive_letter(drive_letter)
@@ -97,21 +140,36 @@ class DeploymentService:
             (
                 "$ErrorActionPreference='Stop'; "
                 "$result = foreach ($disk in Get-Disk) { "
-                "$partitions = @(Get-Partition -DiskNumber $disk.Number -ErrorAction SilentlyContinue); "
+                "$partitions = @(Get-Partition -DiskNumber $disk.Number -ErrorAction Stop); "
                 "$volumes = @($partitions | ForEach-Object { $partition = $_; $volume = $partition | Get-Volume -ErrorAction SilentlyContinue; if ($null -ne $volume -and $null -ne $volume.Size) { $volume } }); "
                 "$volumeSize = [int64](@($volumes | Measure-Object -Property Size -Sum).Sum); "
                 "$volumeFree = [int64](@($volumes | Measure-Object -Property SizeRemaining -Sum).Sum); "
                 "$partitionSize = [int64](@($partitions | Measure-Object -Property Size -Sum).Sum); "
-                "[pscustomobject]@{Number=$disk.Number;FriendlyName=$disk.FriendlyName;BusType=$disk.BusType;SerialNumber=$disk.SerialNumber;Size=[int64]$disk.Size;VolumeSize=$volumeSize;VolumeFree=$volumeFree;Unallocated=[int64][math]::Max(0,([int64]$disk.Size-$partitionSize))} "
-                "}; $result | ConvertTo-Json -Compress"
+                "$letters = @($partitions | Where-Object { $_.DriveLetter -and [string]$_.DriveLetter -ne [string][char]0 } | ForEach-Object { [pscustomobject]@{Number=[int]$_.PartitionNumber;Letter=([string]$_.DriveLetter).ToUpper() + ':'} }); "
+                "[pscustomobject]@{Number=$disk.Number;FriendlyName=[string]$disk.FriendlyName;BusType=[string]$disk.BusType;SerialNumber=[string]$disk.SerialNumber;Size=[int64]$disk.Size;VolumeSize=$volumeSize;VolumeFree=$volumeFree;Unallocated=[int64][math]::Max(0,([int64]$disk.Size-$partitionSize));Partitions=$letters} "
+                "}; $result | ConvertTo-Json -Compress -Depth 4"
             ),
         ]
         try:
             output = self._runner.run(command).stdout.strip()
-            raw_disks = json.loads(output) if output else []
+            raw_disks = json.loads(output.lstrip("\ufeff")) if output else []
             if isinstance(raw_disks, dict):
                 raw_disks = [raw_disks]
-            return [
+            if not isinstance(raw_disks, list):
+                raise ValueError("Expected a list of physical disks.")
+            # Do not accept a partially parsed disk list: a wrong physical number
+            # or a letter assigned to two partitions can select the wrong target.
+            for item in raw_disks:
+                if not isinstance(item, dict) or "Number" not in item or "Size" not in item or "Partitions" not in item or not isinstance(item["Partitions"], list):
+                    raise ValueError("Invalid physical disk or partition metadata.")
+                partitions = item["Partitions"]
+                if any(not isinstance(part, dict) for part in partitions):
+                    raise ValueError("Invalid partition metadata.")
+                numbers = [int(part["Number"]) for part in partitions]
+                letters = [normalize_drive_letter(part["Letter"]) for part in partitions]
+                if any(number < 1 for number in numbers) or len(set(numbers)) != len(numbers) or len(set(letters)) != len(letters):
+                    raise ValueError("Duplicate or invalid partition number / drive letter.")
+            disks = [
                 DiskInfo(
                     number=int(item["Number"]),
                     model=item.get("FriendlyName") or "Unknown physical disk",
@@ -121,10 +179,22 @@ class DeploymentService:
                     volume_size_bytes=int(item.get("VolumeSize") or 0),
                     volume_free_bytes=int(item.get("VolumeFree") or 0),
                     unallocated_bytes=int(item.get("Unallocated") or 0),
+                    partition_letters=tuple(sorted(
+                        (int(partition["Number"]), normalize_drive_letter(partition["Letter"]))
+                        for partition in (item.get("Partitions") or [])
+                    )),
                 )
                 for item in raw_disks
             ]
-        except (CommandExecutionError, json.JSONDecodeError, KeyError, TypeError, ValueError) as error:
+            if any(disk.number < 0 or disk.size_bytes <= 0 for disk in disks):
+                raise ValueError("Invalid physical disk number or capacity.")
+            if len({disk.number for disk in disks}) != len(disks):
+                raise ValueError("Duplicate physical disk numbers.")
+            all_letters = [letter for disk in disks for _, letter in disk.partition_letters]
+            if len(set(all_letters)) != len(all_letters):
+                raise ValueError("One drive letter is assigned to more than one physical disk.")
+            return disks
+        except (CommandExecutionError, json.JSONDecodeError, KeyError, TypeError, ValueError, AttributeError) as error:
             self._logger.error("PowerShell disk discovery failed: %s", error)
             return []
 
@@ -145,13 +215,13 @@ class DeploymentService:
         disks: list[DiskInfo] = []
         for line in output.splitlines():
             stripped = line.strip()
-            if not stripped.lower().startswith("disk ") or "---" in stripped:
+            if not re.match(r"^(?:disk|dysk)\s+\d+\s+", stripped, re.IGNORECASE):
                 continue
             fields = stripped.split()
             if len(fields) < 4 or not fields[1].isdigit():
                 continue
             try:
-                measurements = re.findall(r"\b(\d+(?:\.\d+)?)\s+(KB|MB|GB|TB)\b", stripped, re.IGNORECASE)
+                measurements = re.findall(r"\b(\d+(?:[.,]\d+)?)\s+(KB|MB|GB|TB|B)\b", stripped, re.IGNORECASE)
                 if not measurements:
                     raise ValueError("No disk size was found")
                 size_bytes = self._diskpart_measurement_to_bytes(*measurements[0])
@@ -163,8 +233,8 @@ class DeploymentService:
 
     @staticmethod
     def _diskpart_measurement_to_bytes(value: str, unit: str) -> int:
-        multiplier = {"KB": 1024, "MB": 1024**2, "GB": 1024**3, "TB": 1024**4}[unit.upper()]
-        return int(float(value) * multiplier)
+        multiplier = {"B": 1, "KB": 1024, "MB": 1024**2, "GB": 1024**3, "TB": 1024**4}[unit.upper()]
+        return int(float(value.replace(",", ".")) * multiplier)
 
     def list_volumes(self) -> list[VolumeInfo]:
         """List volumes through Windows APIs; results are independent of UI language."""
@@ -739,6 +809,15 @@ class NetworkService:
             raise ValueError("The network path must start with \\ (for example \\server\\share).")
         command = ["net.exe", "use", drive, unc_path.strip(), password, f"/user:{username}", "/persistent:no"]
         self._runner.run(command, secrets=(password,))
+
+    def connect_unc_share(self, share_root: str, username: str, password: str) -> None:
+        """Authenticate to an SMB share without assigning a drive letter."""
+        if not re.fullmatch(r"\\\\[^\\/]+\\[^\\/]+", share_root):
+            raise ValueError("Expected an SMB share root such as \\\\server\\share.")
+        self._runner.run(
+            ["net.exe", "use", share_root, password, f"/user:{username}", "/persistent:no"],
+            secrets=(password,),
+        )
 
     def disconnect_share(self, drive_letter: str) -> None:
         self._runner.run(["net.exe", "use", normalize_drive_letter(drive_letter), "/delete", "/y"])

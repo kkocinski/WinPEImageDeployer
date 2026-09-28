@@ -8,7 +8,9 @@ build/
 dist/
 *.spec
 *.iso
+*.log
 
 # Private per-site credentials and third-party vendor driver packages.
 winpe-media-content/startup-config.ini
 winpe-media-content/Drivers/
+winpe-media-content/VM-NextBootUSB.ps1

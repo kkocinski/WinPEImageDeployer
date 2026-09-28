@@ -3,8 +3,9 @@
 from __future__ import annotations
 
 import configparser
+import re
 from dataclasses import dataclass
-from pathlib import Path
+from pathlib import Path, PureWindowsPath
 
 from .models import DiskInfo, FirmwareType, normalize_drive_letter, validate_image_index, validate_wim_path
 from .network_adapters import normalize_mac
@@ -29,6 +30,12 @@ class ShareStartupConfig:
 
 
 @dataclass(frozen=True)
+class DiskMappingStartupConfig:
+    serial_number: str
+    partitions: tuple[tuple[int, str], ...]
+
+
+@dataclass(frozen=True)
 class AutoDeployStartupConfig:
     wim_path: str
     image_index: int
@@ -36,6 +43,18 @@ class AutoDeployStartupConfig:
     minimum_disk_size_gib: int
     expected_disk_serial: str
     maximum_disk_size_gib: int | None = None
+    username: str = ""
+    password: str = ""
+
+
+def unc_share_root(wim_path: str) -> str | None:
+    """Extract the SMB share root from a WIM UNC path; reject incomplete paths."""
+    path = PureWindowsPath(wim_path)
+    if not wim_path.startswith("\\\\"):
+        return None
+    if not path.drive or len(path.parts) < 2 or any(part in {".", ".."} for part in path.parts[1:]):
+        raise ValueError("[auto_deploy] UNC wim_path must include a server, share, and WIM file without '..'.")
+    return path.drive
 
 
 @dataclass(frozen=True)
@@ -43,6 +62,7 @@ class StartupConfig:
     ethernet: EthernetStartupConfig | None = None
     share: ShareStartupConfig | None = None
     auto_deploy: AutoDeployStartupConfig | None = None
+    disk_mapping: DiskMappingStartupConfig | None = None
 
 
 def load_startup_config(path: Path) -> StartupConfig:
@@ -54,16 +74,47 @@ def load_startup_config(path: Path) -> StartupConfig:
     except (OSError, configparser.Error) as error:
         raise ValueError(f"Cannot read startup configuration {path}: {error}") from error
 
-    unknown_sections = set(parser.sections()) - {"ethernet", "share", "auto_deploy"}
+    unknown_sections = set(parser.sections()) - {"ethernet", "share", "auto_deploy", "disk_mapping"}
     if unknown_sections:
         raise ValueError(f"Unsupported startup configuration section(s): {', '.join(sorted(unknown_sections))}.")
 
     ethernet = _load_ethernet(parser)
     share = _load_share(parser)
     auto_deploy = _load_auto_deploy(parser)
-    if ethernet is None and share is None and auto_deploy is None:
-        raise ValueError("Startup configuration must contain an [ethernet], [share], or enabled [auto_deploy] section.")
-    return StartupConfig(ethernet=ethernet, share=share, auto_deploy=auto_deploy)
+    disk_mapping = _load_disk_mapping(parser)
+    if ethernet is None and share is None and auto_deploy is None and disk_mapping is None:
+        raise ValueError("Startup configuration must contain an [ethernet], [share], [disk_mapping], or enabled [auto_deploy] section.")
+    return StartupConfig(ethernet=ethernet, share=share, auto_deploy=auto_deploy, disk_mapping=disk_mapping)
+
+
+def _load_disk_mapping(parser: configparser.ConfigParser) -> DiskMappingStartupConfig | None:
+    if not parser.has_section("disk_mapping"):
+        return None
+    section = parser["disk_mapping"]
+    serial_number = section.get("serial_number", "").strip()
+    if not serial_number:
+        raise ValueError("[disk_mapping] requires serial_number=.")
+    partitions: list[tuple[int, str]] = []
+    for key, value in section.items():
+        if key == "serial_number":
+            continue
+        match = re.fullmatch(r"partition_(\d+)", key)
+        if not match:
+            raise ValueError(f"Unsupported [disk_mapping] option: {key}.")
+        number = int(match.group(1))
+        if number < 1 or any(existing == number for existing, _ in partitions):
+            raise ValueError("[disk_mapping] partition numbers must be unique positive integers.")
+        try:
+            letter = normalize_drive_letter(value)
+        except ValueError as error:
+            raise ValueError(f"[disk_mapping] {key} must be a drive letter such as R:.") from error
+        partitions.append((number, letter))
+    if not partitions:
+        raise ValueError("[disk_mapping] requires at least one partition_N = X: mapping.")
+    letters = [letter for _, letter in partitions]
+    if len(set(letters)) != len(letters) or any(letter == "X:" for letter in letters):
+        raise ValueError("[disk_mapping] drive letters must be unique and cannot use X:.")
+    return DiskMappingStartupConfig(serial_number, tuple(sorted(partitions)))
 
 
 def _load_ethernet(parser: configparser.ConfigParser) -> EthernetStartupConfig | None:
@@ -98,7 +149,7 @@ def _load_auto_deploy(parser: configparser.ConfigParser) -> AutoDeployStartupCon
     _validate_keys(
         parser,
         "auto_deploy",
-        {"enabled", "wim_path", "image_index", "firmware", "minimum_disk_size_gib", "maximum_disk_size_gib", "expected_disk_serial"},
+        {"enabled", "wim_path", "image_index", "firmware", "minimum_disk_size_gib", "maximum_disk_size_gib", "expected_disk_serial", "username", "password"},
     )
     try:
         enabled = parser.getboolean("auto_deploy", "enabled", fallback=False)
@@ -127,13 +178,23 @@ def _load_auto_deploy(parser: configparser.ConfigParser) -> AutoDeployStartupCon
             raise ValueError("[auto_deploy] maximum_disk_size_gib must be a positive integer.")
         if maximum_disk_size_gib < minimum_disk_size_gib:
             raise ValueError("[auto_deploy] maximum_disk_size_gib must be at least minimum_disk_size_gib.")
+    wim_path = validate_wim_path(_required_value(parser, "auto_deploy", "wim_path"))
+    share_root = unc_share_root(wim_path)
+    username = parser.get("auto_deploy", "username", fallback="").strip()
+    password = parser.get("auto_deploy", "password", fallback="").strip()
+    if share_root and (not username or not password):
+        raise ValueError("[auto_deploy] UNC wim_path requires username= and password=.")
+    if not share_root and (username or password):
+        raise ValueError("[auto_deploy] username/password are only supported for a UNC wim_path.")
     return AutoDeployStartupConfig(
-        wim_path=validate_wim_path(_required_value(parser, "auto_deploy", "wim_path")),
+        wim_path=wim_path,
         image_index=validate_image_index(_required_value(parser, "auto_deploy", "image_index")),
         firmware=firmware,
         minimum_disk_size_gib=minimum_disk_size_gib,
         expected_disk_serial=parser.get("auto_deploy", "expected_disk_serial", fallback="").strip(),
         maximum_disk_size_gib=maximum_disk_size_gib,
+        username=username,
+        password=password,
     )
 
 

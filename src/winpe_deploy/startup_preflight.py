@@ -14,7 +14,7 @@ from .media_content import MEDIA_CONTENT_DIR
 from .models import validate_wim_path
 from .network_adapters import adapter_names_for_mac
 from .services import DeploymentService, NetworkService, WinPEPowerService
-from .startup_config import AutoDeployStartupConfig, StartupConfig, load_startup_config, select_auto_deploy_target
+from .startup_config import AutoDeployStartupConfig, StartupConfig, load_startup_config, select_auto_deploy_target, unc_share_root
 
 
 STARTUP_LOG_PATH = Path(r"X:\Windows\Temp\WinPEImageDeployer-startup.log")
@@ -124,16 +124,35 @@ def run_startup_preflight(
         logger.error("Startup configuration %s is invalid; automatic deployment was not started and the GUI will open: %s", configuration_path, error)
     else:
         ethernet_configured = _apply_ethernet_configuration(configuration_path, configuration, network, logger)
-        if ethernet_configured and configuration.share is not None:
+        if ethernet_configured and (configuration.share is not None or (configuration.auto_deploy is not None and unc_share_root(configuration.auto_deploy.wim_path))):
             logger.info("Waiting %d seconds after static IPv4 configuration before SMB mapping.", ETHERNET_SETTLE_SECONDS)
             sleeper(ETHERNET_SETTLE_SECONDS)
         _connect_share_with_retry(configuration_path, configuration, network, logger, sleeper)
+        if configuration.disk_mapping is not None:
+            try:
+                _apply_disk_mapping(configuration_path, configuration, deployment, logger)
+            except Exception as error:
+                logger.error("Physical disk mapping failed: %s. Automatic deployment was not started and the GUI will open.", error)
+                return False
         if configuration.auto_deploy is not None:
-            if _run_automatic_deployment(configuration_path, configuration.auto_deploy, deployment, power, logger):
+            if _run_automatic_deployment(configuration_path, configuration.auto_deploy, deployment, power, logger, network, sleeper):
                 logger.info("=== WinPE Image Deployer startup preflight finished after successful automatic deployment ===")
                 return True
     logger.info("=== WinPE Image Deployer startup preflight finished ===")
     return False
+
+
+def _apply_disk_mapping(configuration_path: Path, configuration: StartupConfig, deployment: DeploymentService, logger: logging.Logger) -> None:
+    mapping = configuration.disk_mapping
+    if mapping is None:
+        return
+    source_drive = configuration_path.drive.upper()
+    if source_drive and any(letter == source_drive for _, letter in mapping.partitions):
+        raise ValueError(f"Cannot reassign {source_drive}, which contains the active startup configuration.")
+    logger.info("Mapping partitions on the physical disk with serial %s: %s.", mapping.serial_number,
+                ", ".join(f"partition {number} -> {letter}" for number, letter in mapping.partitions))
+    deployment.map_disk_partitions_by_serial(mapping.serial_number, mapping.partitions)
+    logger.info("Physical disk partition drive-letter mapping completed.")
 
 
 def _run_automatic_deployment(
@@ -142,10 +161,15 @@ def _run_automatic_deployment(
     deployment: DeploymentService,
     power: WinPEPowerService,
     logger: logging.Logger,
+    network: NetworkService,
+    sleeper: Callable[[float], None],
 ) -> bool:
     """Deploy before Tk is created; any validation or runtime failure opens GUI instead."""
     try:
         logger.info("[auto_deploy] enabled: validating WIM, image index, and target disk.")
+        share_root = unc_share_root(configuration.wim_path)
+        if share_root:
+            _connect_auto_deploy_unc_with_retry(share_root, configuration, network, logger, sleeper)
         wim_path = _validate_existing_wim_path(configuration.wim_path)
         images = deployment.inspect_wim(wim_path)
         _require_wim_image_index(images, configuration.image_index)
@@ -164,8 +188,28 @@ def _run_automatic_deployment(
         power.restart()
         return True
     except Exception as error:
-        logger.exception("Automatic deployment was not started or failed: %s. Opening the GUI instead.", error)
+        # Native SMB errors can echo command arguments: never log the password.
+        safe_error = str(error).replace(configuration.password, "********") if configuration.password else str(error)
+        logger.error("Automatic deployment was not started or failed: %s. Opening the GUI instead.", safe_error)
         return False
+
+
+def _connect_auto_deploy_unc_with_retry(
+    share_root: str, configuration: AutoDeployStartupConfig, network: NetworkService,
+    logger: logging.Logger, sleeper: Callable[[float], None],
+) -> None:
+    for attempt in range(1, SMB_CONNECT_ATTEMPTS + 1):
+        try:
+            network.connect_unc_share(share_root, configuration.username, configuration.password)
+            logger.info("Authenticated SMB share %s without mapping a drive.", share_root)
+            return
+        except Exception as error:
+            safe_error = str(error).replace(configuration.password, "********")
+            if attempt == SMB_CONNECT_ATTEMPTS:
+                raise RuntimeError(f"SMB authentication to {share_root} failed after {attempt} attempts: {safe_error}") from None
+            logger.warning("SMB authentication to %s failed on attempt %d/%d: %s. Retrying in %d seconds.",
+                           share_root, attempt, SMB_CONNECT_ATTEMPTS, safe_error, SMB_CONNECT_RETRY_SECONDS)
+            sleeper(SMB_CONNECT_RETRY_SECONDS)
 
 
 def _auto_deploy_protected_disk_numbers(
@@ -173,7 +217,9 @@ def _auto_deploy_protected_disk_numbers(
 ) -> set[int]:
     protected: set[int] = set()
     _protect_path_disk(configuration_path, protected, deployment, logger, required=True)
-    _protect_path_disk(Path(wim_path), protected, deployment, logger, required=False)
+    # Remote WIM storage has no local physical disk; never resolve a UNC share as a target disk.
+    if not unc_share_root(wim_path):
+        _protect_path_disk(Path(wim_path), protected, deployment, logger, required=False)
     return protected
 
 

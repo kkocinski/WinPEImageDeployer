@@ -35,6 +35,7 @@ class DiskInfo:
     volume_size_bytes: int = 0
     volume_free_bytes: int = 0
     unallocated_bytes: int = 0
+    partition_letters: tuple[tuple[int, str], ...] = ()
 
     @property
     def size_gib(self) -> float:
@@ -64,7 +65,8 @@ class DiskInfo:
             if self.volume_size_bytes else " | Volume usage: unavailable"
         )
         usage += f" | Unallocated: {self.unallocated_gib:.1f} GiB"
-        return identity + serial + usage
+        letters = ", ".join(f"P{number}={letter}" for number, letter in self.partition_letters)
+        return identity + serial + usage + f" | Partitions: {letters or 'no assigned letters / unavailable'}"
 
 
 @dataclass(frozen=True)

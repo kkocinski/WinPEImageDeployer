@@ -55,6 +55,25 @@ if not exist "%RUNTIME_CONTENT_SOURCE%\" (
     exit /b 1
 )
 
+rem The Storage cmdlets (Get-Disk/Get-Partition/Get-Volume) used to verify an
+rem expected disk serial require all five optional components in this order.
+if defined WinPERoot set "WINPE_ROOT=%WinPERoot%"
+if not defined WINPE_ROOT set "WINPE_ROOT=%ProgramFiles(x86)%\Windows Kits\10\Assessment and Deployment Kit\Windows Preinstallation Environment"
+set "OC_DIR=%WINPE_ROOT%\%ARCH%\WinPE_OCs"
+set "OC_LANGUAGE=en-us"
+for %%P in (WinPE-WMI WinPE-NetFX WinPE-Scripting WinPE-PowerShell WinPE-StorageWMI) do (
+    if not exist "%OC_DIR%\%%P.cab" (
+        echo ERROR: Missing WinPE optional component: "%OC_DIR%\%%P.cab"
+        echo Install the matching Windows PE add-on for the ADK.
+        exit /b 1
+    )
+    if not exist "%OC_DIR%\%OC_LANGUAGE%\%%P_%OC_LANGUAGE%.cab" (
+        echo ERROR: Missing WinPE language package: "%OC_DIR%\%OC_LANGUAGE%\%%P_%OC_LANGUAGE%.cab"
+        echo Install the matching Windows PE add-on for the ADK.
+        exit /b 1
+    )
+)
+
 for %%I in ("%APP_EXE%") do echo Embedding application built: %%~tI  (%%~zI bytes)
 for /f "tokens=*" %%H in ('certutil -hashfile "%APP_EXE%" SHA256 ^| findstr /R /V "hash CertUtil"') do (
     set "APP_SHA256=%%H"
@@ -95,6 +114,15 @@ echo Mounting boot.wim...
 Dism /Mount-Image /ImageFile:"%WORK_DIR%\media\sources\boot.wim" /Index:1 /MountDir:"%MOUNT_DIR%"
 if errorlevel 1 goto :cleanup_discard
 
+echo Adding WinPE PowerShell and Storage cmdlets to boot.wim...
+for %%P in (WinPE-WMI WinPE-NetFX WinPE-Scripting WinPE-PowerShell WinPE-StorageWMI) do (
+    echo Installing %%P...
+    Dism /Add-Package /Image:"%MOUNT_DIR%" /PackagePath:"%OC_DIR%\%%P.cab"
+    if errorlevel 1 goto :cleanup_discard
+    Dism /Add-Package /Image:"%MOUNT_DIR%" /PackagePath:"%OC_DIR%\%OC_LANGUAGE%\%%P_%OC_LANGUAGE%.cab"
+    if errorlevel 1 goto :cleanup_discard
+)
+
 echo Copying WinPEImageDeployer.exe into boot.wim...
 copy /Y "%APP_EXE%" "%MOUNT_DIR%\Windows\System32\WinPEImageDeployer.exe" >nul
 if errorlevel 1 goto :cleanup_discard
@@ -114,7 +142,7 @@ Dism /Unmount-Image /MountDir:"%MOUNT_DIR%" /Commit
 if errorlevel 1 exit /b 1
 
 echo Copying WinPEImageDeployer runtime content into WinPE media...
-robocopy "%RUNTIME_CONTENT_SOURCE%" "%WORK_DIR%\media\%MEDIA_CONTENT_DIR%" /E /COPY:DAT /DCOPY:DAT /R:1 /W:1 /NFL /NDL /NJH /NJS /XF startup-config.ini.example /XD .git
+robocopy "%RUNTIME_CONTENT_SOURCE%" "%WORK_DIR%\media\%MEDIA_CONTENT_DIR%" /E /COPY:DAT /DCOPY:DAT /R:1 /W:1 /NFL /NDL /NJH /NJS /XF startup-config.ini.example VM-NextBootUSB.ps1 /XD .git
 set "ROBOCOPY_EXIT=%ERRORLEVEL%"
 if %ROBOCOPY_EXIT% GEQ 8 (
     echo ERROR: Could not copy runtime content into WinPE media. Robocopy exit code: %ROBOCOPY_EXIT%

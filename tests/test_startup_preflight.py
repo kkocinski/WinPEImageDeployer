@@ -56,6 +56,7 @@ class FakeNetworkService:
     def __init__(self) -> None:
         self.configured: list[tuple[str, str, str, str, str]] = []
         self.share_calls: list[tuple[str, str, str, str]] = []
+        self.unc_calls: list[tuple[str, str, str]] = []
 
     def list_adapters(self) -> list[str]:
         return ["Ethernet"]
@@ -65,6 +66,9 @@ class FakeNetworkService:
 
     def connect_share(self, *args) -> None:
         self.share_calls.append(args)
+
+    def connect_unc_share(self, *args) -> None:
+        self.unc_calls.append(args)
 
 
 class RetryNetworkService(FakeNetworkService):
@@ -80,6 +84,108 @@ class RetryNetworkService(FakeNetworkService):
 
 
 class StartupPreflightTests(unittest.TestCase):
+    def test_unc_auto_deploy_authenticates_without_mapping_and_retries_before_disk_changes(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            content = root / MEDIA_CONTENT_DIR
+            content.mkdir()
+            (content / "startup-config.ini").write_text(
+                "[auto_deploy]\nenabled = true\nwim_path = \\\\server\\images\\base.wim\n"
+                "username = DOMAIN\\deploy\npassword = secret\nimage_index = 1\n"
+                "firmware = UEFI (GPT)\nminimum_disk_size_gib = 100\n", encoding="utf-8",
+            )
+            deployment = AutoDeployFakeDeploymentService(protected_disk_number=1)
+            network = FakeNetworkService()
+            network.connect_unc_share = mock.Mock(side_effect=[RuntimeError("not ready"), None])
+            power = FakePowerService()
+            waits = []
+            with mock.patch("winpe_deploy.startup_preflight._validate_existing_wim_path", side_effect=lambda path: path), \
+                 mock.patch("winpe_deploy.startup_preflight._drive_type", return_value=3):
+                completed = run_startup_preflight(
+                    roots=[root], deployment=deployment, network=network, power=power,
+                    sleeper=waits.append, logger=logging.getLogger("test_unc_deploy"),
+                )
+        self.assertTrue(completed)
+        self.assertEqual([5], waits)
+        self.assertEqual(2, network.connect_unc_share.call_count)
+        network.connect_unc_share.assert_called_with("\\\\server\\images", "DOMAIN\\deploy", "secret")
+        self.assertEqual([], network.share_calls)
+        self.assertEqual("\\\\server\\images\\base.wim", deployment.deployed[0][0])
+        self.assertEqual(0, deployment.deployed[0][2])
+        self.assertEqual(1, power.restart_calls)
+
+    def test_unc_auto_deploy_fails_closed_and_redacts_password_on_connection_failure(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            content = root / MEDIA_CONTENT_DIR
+            content.mkdir()
+            (content / "startup-config.ini").write_text(
+                "[auto_deploy]\nenabled = true\nwim_path = \\\\server\\images\\base.wim\n"
+                "username = tech\npassword = secret\nimage_index = 1\n"
+                "firmware = UEFI (GPT)\nminimum_disk_size_gib = 100\n", encoding="utf-8",
+            )
+            deployment = AutoDeployFakeDeploymentService(protected_disk_number=1)
+            network = FakeNetworkService()
+            network.connect_unc_share = mock.Mock(side_effect=RuntimeError("bad secret"))
+            waits = []
+            with self.assertLogs("test_unc_failure", level="WARNING") as captured:
+                completed = run_startup_preflight(
+                    roots=[root], deployment=deployment, network=network,
+                    sleeper=waits.append, logger=logging.getLogger("test_unc_failure"),
+                )
+        self.assertFalse(completed)
+        self.assertEqual(6, network.connect_unc_share.call_count)
+        self.assertEqual([5] * 5, waits)
+        self.assertEqual([], deployment.deployed)
+        self.assertNotIn("secret", "\n".join(captured.output))
+
+    def test_unc_auto_deploy_does_not_erase_disk_if_wim_is_missing(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            content = root / MEDIA_CONTENT_DIR
+            content.mkdir()
+            (content / "startup-config.ini").write_text(
+                "[auto_deploy]\nenabled = true\nwim_path = \\\\server\\images\\missing.wim\n"
+                "username = tech\npassword = secret\nimage_index = 1\n"
+                "firmware = UEFI (GPT)\nminimum_disk_size_gib = 100\n", encoding="utf-8",
+            )
+            deployment = AutoDeployFakeDeploymentService(protected_disk_number=1)
+            network = FakeNetworkService()
+            with mock.patch("winpe_deploy.startup_preflight._validate_existing_wim_path", side_effect=ValueError("WIM inaccessible")):
+                completed = run_startup_preflight(
+                    roots=[root], deployment=deployment, network=network,
+                    sleeper=lambda _: None, logger=logging.getLogger("test_unc_missing_wim"),
+                )
+        self.assertFalse(completed)
+        self.assertEqual(1, len(network.unc_calls))
+        self.assertEqual([], deployment.deployed)
+
+    def test_unc_auto_deploy_waits_after_static_ipv4_before_authentication(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            content = root / MEDIA_CONTENT_DIR
+            content.mkdir()
+            (content / "startup-config.ini").write_text(
+                "[ethernet]\nadapter = Ethernet\naddress = 10.0.0.2\nmask = 255.255.255.0\n"
+                "[auto_deploy]\nenabled = true\nwim_path = \\\\server\\images\\base.wim\n"
+                "username = tech\npassword = secret\nimage_index = 1\n"
+                "firmware = UEFI (GPT)\nminimum_disk_size_gib = 100\n", encoding="utf-8",
+            )
+            events = []
+            network = FakeNetworkService()
+            network.configure_ipv4 = lambda *args: events.append("ipv4")
+            network.connect_unc_share = lambda *args: events.append("unc")
+            deployment = AutoDeployFakeDeploymentService(protected_disk_number=1)
+            with mock.patch("winpe_deploy.startup_preflight._validate_existing_wim_path", side_effect=ValueError("not accessible")):
+                completed = run_startup_preflight(
+                    roots=[root], deployment=deployment, network=network,
+                    sleeper=lambda seconds: events.append(f"wait:{seconds}"),
+                    logger=logging.getLogger("test_unc_ipv4_wait"),
+                )
+        self.assertFalse(completed)
+        self.assertEqual(["ipv4", "wait:10", "unc"], events)
+        self.assertEqual([], deployment.deployed)
+
     def test_mac_selects_named_adapter_before_configuring_ipv4(self) -> None:
         network = FakeNetworkService()
         network.list_adapters = lambda: ["Ethernet", "Local Area Connection 3"]
@@ -162,6 +268,36 @@ class StartupPreflightTests(unittest.TestCase):
         self.assertEqual([("Ethernet", "192.168.1.241", "255.255.255.0", "192.168.1.1", "1.1.1.1")], network.configured)
         self.assertEqual([("Z:", "\\\\server\\deployment", "tech", "secret")], network.share_calls)
         self.assertEqual([10, 10], waits)
+
+    def test_preflight_maps_multiple_partitions_by_disk_serial(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            content = root / MEDIA_CONTENT_DIR
+            content.mkdir()
+            (content / "startup-config.ini").write_text(
+                "[disk_mapping]\nserial_number = IMAGE-DISK-01\npartition_1 = R:\npartition_3 = S:\n",
+                encoding="utf-8",
+            )
+            deployment = FakeDeploymentService()
+            deployment.map_disk_partitions_by_serial = mock.Mock()
+            run_startup_preflight(roots=[root], deployment=deployment, network=FakeNetworkService(),
+                                  logger=logging.getLogger("test_partition_mapping"), sleeper=lambda _: None)
+        deployment.map_disk_partitions_by_serial.assert_called_once_with("IMAGE-DISK-01", ((1, "R:"), (3, "S:")))
+
+    def test_preflight_refuses_mapping_over_startup_media_letter(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            content = root / MEDIA_CONTENT_DIR
+            content.mkdir()
+            config = content / "startup-config.ini"
+            config.write_text("[disk_mapping]\nserial_number = IMAGE-DISK-01\npartition_1 = R:\n", encoding="utf-8")
+            deployment = FakeDeploymentService()
+            deployment.map_disk_partitions_by_serial = mock.Mock()
+            with mock.patch("winpe_deploy.startup_preflight.Path.drive", new_callable=mock.PropertyMock, return_value="R:"):
+                completed = run_startup_preflight(roots=[root], deployment=deployment, network=FakeNetworkService(),
+                                                  logger=logging.getLogger("test_partition_mapping_protection"), sleeper=lambda _: None)
+        self.assertFalse(completed)
+        deployment.map_disk_partitions_by_serial.assert_not_called()
 
     def test_preflight_deploys_before_gui_when_one_eligible_disk_remains(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:
