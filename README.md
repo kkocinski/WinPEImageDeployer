@@ -1,12 +1,12 @@
 # WinPE Image Deployer
 
-WinPE Image Deployer 0.2.4 is a Python 3.12 Tkinter application for capturing, servicing, storing, and deploying Windows images in Windows PE. It uses native Windows tools: **DISM**, **DiskPart**, **BCDBoot**, **netsh**, and **net use**.
+WinPE Image Deployer 0.2.5 is a Python 3.12 Tkinter application for capturing, servicing, storing, and deploying Windows images in Windows PE. It uses native Windows tools: **DISM**, **DiskPart**, **BCDBoot**, **netsh**, and **net use**.
 
 ## How this project was created
 
 According to the project initiator, **ChatGPT 5.6 Terra and ChatGPT 6 Sol generated this project's code and documentation** from the initiator's prompts and directions. The initiator specified what to build and guided the work, but did not write the code. This attribution uses the model names provided by the initiator; individual contributions by each model have not been independently verified.
 
-> **Project status — unstable, under active development.** Version 0.2.4 is published as source code for review and further development, **not an official release or production-ready build**. Unit tests use mocked operating-system commands; they do not verify real disk operations, WinPE startup, or UEFI boot behavior. The project initiator reports testing on a physical machine, but comprehensive end-to-end validation across representative WinPE hardware is **not documented in this repository**. Test in a VM and on disposable hardware before considering any real deployment.
+> **Project status — unstable, under active development.** Version 0.2.5 is published as source code for review and further development, **not an official release or production-ready build**. Unit tests use mocked operating-system commands; they do not verify real disk operations, WinPE startup, or UEFI boot behavior. The project initiator reports testing on a physical machine, but comprehensive end-to-end validation across representative WinPE hardware is **not documented in this repository**. Test in a VM and on disposable hardware before considering any real deployment.
 
 > **Warning**: Deployment permanently erases the selected target disk. Review the disk number, model, and size before confirming an operation.
 
@@ -169,6 +169,7 @@ password = replace-with-password
 [auto_deploy]
 enabled = false
 wim_path = Z:\Images\Windows11.wim
+source_disk_serial =
 image_index = 1
 firmware = UEFI (GPT)
 minimum_disk_size_gib = 100
@@ -180,7 +181,9 @@ expected_disk_serial =
 
 `[auto_deploy]` has one behavior: `enabled = true` starts a non-interactive deployment before the GUI is created, after drivers, Ethernet, and SMB initialization have completed. The WinPE command window displays progress and the same messages are written to `X:\Windows\Temp\WinPEImageDeployer-startup.log`. Invalid configuration, an inaccessible WIM, a missing image index, or any ambiguous disk layout prevents deployment and opens the GUI instead.
 
-Auto-deploy is fail-closed. The physical disk containing `startup-config.ini` is protected, as is the disk containing a local WIM path. CD-ROM/ISO and SMB paths do not resolve to a cleanable disk. The size must meet `minimum_disk_size_gib`; optional `maximum_disk_size_gib` is an inclusive upper bound (positive integer, at least the minimum). Leave it empty or omit it for no upper bound. For example, `maximum_disk_size_gib = 1100` includes a 1 TB disk (~931 GiB) and excludes a 4 TB disk (~3725 GiB). `expected_disk_serial` is optional: when set, exactly one unprotected disk within the size bounds must have that exact serial, even if other disks are present; PowerShell disk metadata is required. When empty, target discovery uses DiskPart and exactly one unprotected disk within the size bounds must remain, so minimal WinPE does not need PowerShell. Zero or multiple matches skip deployment and open the GUI. Deployment runs DiskPart `clean` on the selected disk and destroys **all** its partitions; it cannot preserve another partition on that disk.
+To use an image disk without assigning letters, set `source_disk_serial = WX12A71235D5` and `wim_path = Images\PL_3551_01_ATS_Ready.wim`. Exactly one physical disk must have this serial and exactly one already mounted partition must contain that exact relative WIM path. Other WIM files do not matter. The entire source disk is excluded from targets; missing letters, zero or multiple matches abort automatic deployment. PowerShell disk metadata is required.
+
+Auto-deploy is fail-closed. The physical disk containing `startup-config.ini` is protected, as is the disk containing a local WIM path. CD-ROM/ISO and SMB paths do not resolve to a cleanable disk. The size must meet `minimum_disk_size_gib`; optional `maximum_disk_size_gib` is an inclusive upper bound (positive integer, at least the minimum). Leave it empty or omit it for no upper bound. For example, `maximum_disk_size_gib = 1100` includes a 1 TB disk (~931 GiB) and excludes a 4 TB disk (~3725 GiB). `expected_disk_serial` is optional: when set, exactly one unprotected disk within the size bounds must have that exact serial, even if other disks are present; PowerShell disk metadata is required. When both `expected_disk_serial` and `source_disk_serial` are empty, target discovery uses DiskPart and exactly one unprotected disk within the size bounds must remain, so minimal WinPE does not need PowerShell. Zero or multiple matches skip deployment and open the GUI. Deployment runs DiskPart `clean` on the selected disk and destroys **all** its partitions; it cannot preserve another partition on that disk.
 
 ```powershell
 powershell.exe -NoProfile -Command "Get-Disk | Format-Table Number,FriendlyName,BusType,SerialNumber,Size -AutoSize"

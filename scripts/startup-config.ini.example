@@ -14,15 +14,6 @@ mask = 255.255.255.0
 gateway = 192.168.1.1
 dns = 192.168.1.1, 1.1.1.1
 
-; Optional: assign stable drive letters to selected partitions on one physical disk.
-; Find its serial with: Get-Disk | Format-Table Number,SerialNumber,FriendlyName
-; Partition numbers are per-disk (Get-Partition -DiskNumber N); no partitions are created or formatted.
-; Uncomment and set serial_number plus partition mappings to enable:
-; [disk_mapping]
-; serial_number = REPLACE-WITH-EXACT-DISK-SERIAL
-; partition_1 = R:
-; partition_2 = S:
-
 [share]
 drive_letter = Z:
 unc_path = \\server\deployment
@@ -39,7 +30,10 @@ password = replace-with-password
 enabled = false
 ; Alternatively use \\server\deployment\Images\Windows11.wim without mapping a drive.
 ; A direct UNC WIM requires username and password below; [share] is not needed.
+; With source_disk_serial set, instead use wim_path = Images\PL_3551_01_ATS_Ready.wim
+; No drive letters are changed. The source disk is protected from cleaning.
 wim_path = Z:\Images\Windows11.wim
+source_disk_serial =
 username =
 password =
 image_index = 1

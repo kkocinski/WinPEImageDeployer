@@ -42,15 +42,15 @@ With `enabled = true`, automatic deployment restarts WinPE after successful depl
 
 The **Text Editor** tab can open, edit, save, and save-as text files stored on local WinPE media. Use **Open startup-config.ini** when exactly one active startup configuration is present. Changes to `startup-config.ini` are saved immediately, but require a WinPE restart before pre-GUI drivers, Ethernet, and SMB startup actions use the new settings.
 
-## Stable physical disk partition letters
+## WIM on a physical source disk
 
-Optional `[disk_mapping]` selects one physical disk by exact serial number and assigns letters to explicitly numbered partitions, for example `partition_1 = R:` and `partition_2 = S:`. A disk may have any number of partitions; only listed ones are changed. This does not create, format, clean, or delete partitions. Ambiguous/missing serials, missing partitions, occupied letters, or overwriting the startup-media letter fail closed. PowerShell Storage cmdlets are required. Configure this before using a mapped local WIM path in `[auto_deploy]`.
+Set `[auto_deploy] source_disk_serial` to the exact physical disk serial and `wim_path` to a relative filename such as `Images\PL_3551_01_ATS_Ready.wim`. WinPE checks that exact filename on already mounted partitions of that one disk. Other WIM files are ignored; zero or multiple matching files abort automatic deployment. The entire source disk is protected. No partition letters are assigned or changed; partitions without a letter cannot be searched. PowerShell Storage metadata is required.
 
 ## Automatic deployment behavior
 
 **Destructive scope:** The current workflow treats one physical target disk as dedicated to one Windows installation; it erases all existing partitions on that disk. "One disk, one partition" describes the intended single Windows/data volume, not the literal UEFI layout (which also needs EFI and MSR partitions). A separate D: data partition on the target disk will not be retained. Disk-to-disk copying and partition-to-partition copying/restoration are potential future features, not available in this version.
 
-When `[auto_deploy] enabled = true`, WinPE validates the WIM and image index, protects the configuration-media disk and any local WIM disk, and deploys only if exactly one disk within the configured size bounds remains. Optional `maximum_disk_size_gib` is inclusive; leave it empty for no upper limit (e.g. `1100` permits a 1 TB disk but excludes a 4 TB disk). This runs before the GUI and writes status to both the WinPE command window and `X:\Windows\Temp\WinPEImageDeployer-startup.log`. Leave `expected_disk_serial` empty to use DiskPart-only discovery in minimal WinPE. When a serial is configured, PowerShell disk metadata is required to verify it. Invalid configuration or any ambiguity prevents deployment and opens the GUI.
+When `[auto_deploy] enabled = true`, WinPE validates the WIM and image index, protects the configuration-media disk and any local WIM disk, and deploys only if exactly one disk within the configured size bounds remains. Optional `maximum_disk_size_gib` is inclusive; leave it empty for no upper limit (e.g. `1100` permits a 1 TB disk but excludes a 4 TB disk). This runs before the GUI and writes status to both the WinPE command window and `X:\Windows\Temp\WinPEImageDeployer-startup.log`. Leave both `expected_disk_serial` and `source_disk_serial` empty to use DiskPart-only discovery in minimal WinPE. When a serial is configured, PowerShell disk metadata is required to verify it. Invalid configuration or any ambiguity prevents deployment and opens the GUI.
 
 ## USB created through Rufus from an ISO
 

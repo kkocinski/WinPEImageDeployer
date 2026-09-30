@@ -8,10 +8,11 @@ import sys
 import time
 from collections.abc import Callable, Iterable
 from pathlib import Path
+from pathlib import PureWindowsPath
 
 from .command_runner import CommandRunner
 from .media_content import MEDIA_CONTENT_DIR
-from .models import validate_wim_path
+from .models import DiskInfo, validate_wim_path
 from .network_adapters import adapter_names_for_mac
 from .services import DeploymentService, NetworkService, WinPEPowerService
 from .startup_config import AutoDeployStartupConfig, StartupConfig, load_startup_config, select_auto_deploy_target, unc_share_root
@@ -128,31 +129,12 @@ def run_startup_preflight(
             logger.info("Waiting %d seconds after static IPv4 configuration before SMB mapping.", ETHERNET_SETTLE_SECONDS)
             sleeper(ETHERNET_SETTLE_SECONDS)
         _connect_share_with_retry(configuration_path, configuration, network, logger, sleeper)
-        if configuration.disk_mapping is not None:
-            try:
-                _apply_disk_mapping(configuration_path, configuration, deployment, logger)
-            except Exception as error:
-                logger.error("Physical disk mapping failed: %s. Automatic deployment was not started and the GUI will open.", error)
-                return False
         if configuration.auto_deploy is not None:
             if _run_automatic_deployment(configuration_path, configuration.auto_deploy, deployment, power, logger, network, sleeper):
                 logger.info("=== WinPE Image Deployer startup preflight finished after successful automatic deployment ===")
                 return True
     logger.info("=== WinPE Image Deployer startup preflight finished ===")
     return False
-
-
-def _apply_disk_mapping(configuration_path: Path, configuration: StartupConfig, deployment: DeploymentService, logger: logging.Logger) -> None:
-    mapping = configuration.disk_mapping
-    if mapping is None:
-        return
-    source_drive = configuration_path.drive.upper()
-    if source_drive and any(letter == source_drive for _, letter in mapping.partitions):
-        raise ValueError(f"Cannot reassign {source_drive}, which contains the active startup configuration.")
-    logger.info("Mapping partitions on the physical disk with serial %s: %s.", mapping.serial_number,
-                ", ".join(f"partition {number} -> {letter}" for number, letter in mapping.partitions))
-    deployment.map_disk_partitions_by_serial(mapping.serial_number, mapping.partitions)
-    logger.info("Physical disk partition drive-letter mapping completed.")
 
 
 def _run_automatic_deployment(
@@ -170,17 +152,28 @@ def _run_automatic_deployment(
         share_root = unc_share_root(configuration.wim_path)
         if share_root:
             _connect_auto_deploy_unc_with_retry(share_root, configuration, network, logger, sleeper)
-        wim_path = _validate_existing_wim_path(configuration.wim_path)
+        disks = deployment.list_disks_for_auto_deploy() if (configuration.expected_disk_serial or configuration.source_disk_serial) else deployment.list_disks()
+        source_disk = None
+        if configuration.source_disk_serial:
+            wim_path, source_disk = _resolve_source_wim(configuration, disks, deployment)
+        else:
+            wim_path = _validate_existing_wim_path(configuration.wim_path)
         images = deployment.inspect_wim(wim_path)
         _require_wim_image_index(images, configuration.image_index)
         protected_disks = _auto_deploy_protected_disk_numbers(configuration_path, wim_path, deployment, logger)
-        disks = deployment.list_disks_for_auto_deploy() if configuration.expected_disk_serial else deployment.list_disks()
+        if source_disk is not None:
+            protected_disks.add(source_disk.number)
+            logger.info("Auto-deploy protected Disk %d as the WIM source disk.", source_disk.number)
         logger.info(
             "Auto-deploy evaluation: protected disks=%s; detected disks=%s",
             sorted(protected_disks),
             "; ".join(disk.display_name() for disk in disks) or "none",
         )
         target = select_auto_deploy_target(disks, protected_disks, configuration)
+        if source_disk is not None:
+            # Recheck the mounted letter just before clean, not only the metadata snapshot.
+            if deployment.disk_number_for_drive(PureWindowsPath(wim_path).drive) != source_disk.number:
+                raise ValueError("WIM drive no longer belongs to the selected source disk.")
         logger.info("Auto-deploy selected eligible target: %s", target.display_name())
         logger.info("Starting automatic deployment to Disk %d. All existing data on this disk will be erased.", target.number)
         deployment.deploy_image(wim_path, configuration.image_index, target.number, configuration.firmware, logger.info)
@@ -192,6 +185,24 @@ def _run_automatic_deployment(
         safe_error = str(error).replace(configuration.password, "********") if configuration.password else str(error)
         logger.error("Automatic deployment was not started or failed: %s. Opening the GUI instead.", safe_error)
         return False
+
+
+def _resolve_source_wim(configuration: AutoDeployStartupConfig, disks: list[DiskInfo], deployment: DeploymentService) -> tuple[str, DiskInfo]:
+    matches = [disk for disk in disks if disk.serial_number.strip() == configuration.source_disk_serial]
+    if len(matches) != 1:
+        raise ValueError(f"WIM source serial must identify exactly one physical disk; found {len(matches)}.")
+    source_disk = matches[0]
+    found: list[str] = []
+    for _, letter in source_disk.partition_letters:
+        # Resolve only the configured relative filename, not every WIM on the disk.
+        candidate = str(PureWindowsPath(letter + "\\") / configuration.wim_path)
+        if Path(candidate).is_file():
+            if deployment.disk_number_for_drive(letter) != source_disk.number:
+                raise ValueError(f"WIM drive {letter} does not belong to the selected source disk.")
+            found.append(candidate)
+    if len(found) != 1:
+        raise ValueError(f"Expected exactly one accessible WIM at {configuration.wim_path} on source disk; found {len(found)}.")
+    return _validate_existing_wim_path(found[0]), source_disk
 
 
 def _connect_auto_deploy_unc_with_retry(

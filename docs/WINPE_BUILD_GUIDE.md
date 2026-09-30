@@ -82,18 +82,11 @@ Before any destructive action, preflight records protected disk numbers, detecte
 
 The file contains an intentionally plaintext password for the offline removable-media workflow. Keep the USB physically secure and use an SMB account with only the permissions required for image storage. The application redacts the password from command logs. Configuration errors, adapter absence, and SMB mapping failures are warnings only and do not prevent the GUI from opening.
 
-### Stable letters for partitions on a physical disk
+### WIM on a physical source disk
 
-To assign predictable drive letters to selected partitions on an image USB/HDD, add `[disk_mapping]` to `startup-config.ini`:
+Set `source_disk_serial` to the exact serial from `Get-Disk` and use a relative `wim_path`, e.g. `Images\PL_3551_01_ATS_Ready.wim`. WinPE searches this exact path on the already mounted partitions of the uniquely identified disk; other WIM files do not matter. Exactly one match is required. The whole source disk is excluded from target selection. No drive letters or partition mappings are changed. A partition without an accessible letter cannot be searched; missing or duplicate matches skip auto-deploy and open the GUI. This mode requires PowerShell Storage cmdlets.
 
-```ini
-[disk_mapping]
-serial_number = EXACT-DISK-SERIAL
-partition_1 = R:
-partition_2 = S:
-```
-
-The serial identifies exactly one physical disk; `partition_N` is that disk's Windows partition number, so disks with multiple partitions are supported. Only listed partitions receive requested letters. Existing partitions and filesystems are not created, formatted, cleaned, or deleted. Choose letters not already used by other disks. If the serial is missing/ambiguous, a partition is missing, a requested letter conflicts, or the target letter would replace the startup-config media letter, mapping fails closed and the GUI opens. This requires WinPE PowerShell Storage cmdlets (`Get-Disk`, `Get-Partition`, `Set-Partition`), included by this repository's media build script. Mapping runs before auto-deploy validation, allowing `wim_path = R:\Images\Windows.wim` when the WIM partition is mapped here. Find values with `Get-Disk | Format-Table Number,SerialNumber,FriendlyName` and `Get-Partition -DiskNumber <number> | Format-Table PartitionNumber,DriveLetter,Type,Size`.
+For example, in `[auto_deploy]` use `enabled = true`, `source_disk_serial = WX12A71235D5`, and `wim_path = Images\PL_3551_01_ATS_Ready.wim` together with the required `image_index`, `firmware`, and `minimum_disk_size_gib` settings below. Do not use `[disk_mapping]`: it is no longer supported.
 
 In `[ethernet]`, specify `adapter = Ethernet` **or** `mac = AA-BB-CC-01-02-FF` (colon separators also work). For MAC-only selection, remove or clear `adapter`. If both are given, they must identify the same interface. When no interface or multiple interfaces match the MAC, static IPv4 is not applied; check the startup log. MAC matching uses the Windows network adapter list, not the interface name or list position.
 
@@ -107,6 +100,7 @@ The same `startup-config.ini` can include `[auto_deploy]`:
 [auto_deploy]
 enabled = false
 wim_path = Z:\Images\Windows11.wim
+source_disk_serial =
 image_index = 1
 firmware = UEFI (GPT)
 minimum_disk_size_gib = 100
@@ -124,7 +118,7 @@ password = replace-with-password
 
 WinPE authenticates to the share root (`\\server\deployment`) with `net use` without mapping it, then DISM reads the WIM by UNC path. The direct connection is retried up to 6 times, 5 seconds apart; after applying static IPv4, the first attempt waits 10 seconds. If authentication fails or the WIM cannot be accessed, **no disk is erased** and the GUI opens. The account needs read access to the share and WIM. Keep this plaintext password off Git and protect the boot medium physically. Do not supply `[auto_deploy]` credentials for a drive-letter `wim_path`; for mapped drives use the existing `[share]` credentials instead. The remote WIM is not treated as a local disk; the configuration/boot medium remains protected. Test UNC access and disk selection in WinPE before enabling automatic deployment.
 
-Set `enabled = true` only after validating the hardware layout. This starts destructive deployment before the GUI is created, after optional drivers, Ethernet, and SMB mapping complete. It validates that the WIM exists, confirms the configured image index through DISM, and protects the disk holding the configuration and any local WIM. Optional `maximum_disk_size_gib` is an inclusive upper size bound in GiB; leave it empty for no upper bound. For example, `1100` permits a 1 TB disk (~931 GiB) but excludes a 4 TB disk (~3725 GiB). With an empty `expected_disk_serial`, exactly one unprotected disk within the size bounds must remain; this works in minimal WinPE through DiskPart. With a serial configured, PowerShell metadata is required and exactly one unprotected disk within the size bounds must match the serial exactly, even if other disks are present. The selected disk is cleaned in its entirety; this mode does not preserve any partition on it. After successful deployment and boot-file creation, WinPE restarts with `wpeutil Reboot`. Any validation or deployment failure is logged and opens the GUI instead.
+Set `enabled = true` only after validating the hardware layout. This starts destructive deployment before the GUI is created, after optional drivers, Ethernet, and SMB mapping complete. It validates that the WIM exists, confirms the configured image index through DISM, and protects the disk holding the configuration and any local WIM. Optional `maximum_disk_size_gib` is an inclusive upper size bound in GiB; leave it empty for no upper bound. For example, `1100` permits a 1 TB disk (~931 GiB) but excludes a 4 TB disk (~3725 GiB). With both `expected_disk_serial` and `source_disk_serial` empty, exactly one unprotected disk within the size bounds must remain; this works in minimal WinPE through DiskPart. With a serial configured, PowerShell metadata is required and exactly one unprotected disk within the size bounds must match the serial exactly, even if other disks are present. The selected disk is cleaned in its entirety; this mode does not preserve any partition on it. After successful deployment and boot-file creation, WinPE restarts with `wpeutil Reboot`. Any validation or deployment failure is logged and opens the GUI instead.
 
 Automatic deployment is deliberately fail-closed: the disk containing the configuration is protected; a disk containing a local WIM is also protected; CD-ROM/ISO media cannot be selected; the minimum and configured maximum size are enforced; and exactly one eligible target must remain. Any failure prevents auto-deploy and opens the GUI.
 

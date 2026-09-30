@@ -1,5 +1,7 @@
 import json
 import logging
+import subprocess
+import sys
 import tempfile
 import unittest
 from pathlib import Path
@@ -364,8 +366,21 @@ class DeploymentServiceTests(unittest.TestCase):
         script = self.runner.commands[0][0][1]
         self.assertIn("select disk 2", script)
         self.assertIn("create partition primary size=10240", script)
+        self.assertNotIn("offset=", script)
         self.assertIn('format quick fs=NTFS label="Data"', script)
         self.assertIn("assign letter=F", script)
+
+    def test_create_primary_partition_uses_explicit_advanced_offset(self) -> None:
+        self.service._run_diskpart = lambda script: self.runner.commands.append((("diskpart-script", script), ()))
+        self.service.create_primary_partition(2, 1024, "NTFS", "Data", None, offset_kib=1048576)
+        self.assertIn("create partition primary size=1024 offset=1048576", self.runner.commands[0][0][1])
+
+    def test_create_primary_partition_rejects_invalid_offset_before_diskpart(self) -> None:
+        self.service._run_diskpart = lambda script: self.runner.commands.append((("diskpart-script", script), ()))
+        for offset in (-1, True, "1024"):
+            with self.subTest(offset=offset), self.assertRaisesRegex(ValueError, "offset"):
+                self.service.create_primary_partition(2, 1024, "NTFS", "Data", None, offset_kib=offset)
+        self.assertEqual([], self.runner.commands)
 
     def test_delete_partition_uses_selected_disk_and_override(self) -> None:
         self.service._run_diskpart = lambda script: self.runner.commands.append((("diskpart-script", script), ()))
@@ -641,26 +656,6 @@ class NetworkServiceTests(unittest.TestCase):
         with self.assertRaises(ValueError):
             service.connect_unc_share("\\\\server\\images\\folder", "tech", "secret")
 
-    def test_disk_mapping_uses_serial_and_explicit_partition_numbers_without_diskpart_clean(self) -> None:
-        runner = FakeRunner()
-        DeploymentService(runner, logging.getLogger("test_disk_mapping")).map_disk_partitions_by_serial(
-            "SERIAL-123", ((1, "R:"), (3, "S:")),
-        )
-        command = runner.commands[0][0]
-        self.assertEqual("powershell.exe", command[0])
-        self.assertIn("([string]$_.SerialNumber).Trim() -eq 'SERIAL-123'", command[-1])
-        self.assertIn("$partitions[[string][int]$entry[0]]", command[-1])
-        self.assertIn("Add-PartitionAccessPath", command[-1])
-        self.assertNotIn("Set-Partition", command[-1])
-        self.assertNotIn("Clear-Disk", command[-1])
-        self.assertNotIn("Format-", command[-1])
-        self.assertIn("$used = @(Get-Partition", command[-1])
-        self.assertIn("non-target partition", command[-1])
-        self.assertIn("$partition.DriveLetter", command[-1])
-        self.assertIn('[[1, "R"], [3, "S"]]', command[-1])
-        self.assertIn("AccessPath", command[-1])
-        self.assertIn("-ErrorAction Stop", command[-1])
-
     def test_command_runner_redacts_secret_in_native_output_and_error(self) -> None:
         import logging
         from types import SimpleNamespace
@@ -691,6 +686,22 @@ class NetworkServiceTests(unittest.TestCase):
             path.write_text(base + "wim_path = \\\\server\\images\\base.wim\nusername = tech\npassword = secret\n", encoding="utf-8")
             config = load_startup_config(path)
             self.assertEqual("tech", config.auto_deploy.username)
+
+    def test_source_serial_requires_safe_relative_wim_and_rejects_old_mapping(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            path = Path(temporary) / "startup-config.ini"
+            base = "[auto_deploy]\nenabled = true\nimage_index = 1\nfirmware = UEFI (GPT)\nminimum_disk_size_gib = 100\n"
+            path.write_text(base + "source_disk_serial = SOURCE\nwim_path = Images\\base.wim\n", encoding="utf-8")
+            config = load_startup_config(path)
+            self.assertEqual("SOURCE", config.auto_deploy.source_disk_serial)
+            for wim in ("C:\\Images\\base.wim", "\\\\server\\share\\base.wim", "..\\base.wim", "Images\\..\\base.wim", "\\Images\\base.wim"):
+                with self.subTest(wim=wim):
+                    path.write_text(base + f"source_disk_serial = SOURCE\nwim_path = {wim}\n", encoding="utf-8")
+                    with self.assertRaises(ValueError):
+                        load_startup_config(path)
+            path.write_text("[disk_mapping]\nserial_number = SOURCE\npartition_2 = R\n", encoding="utf-8")
+            with self.assertRaisesRegex(ValueError, "Unsupported startup configuration section"):
+                load_startup_config(path)
 
     def test_configure_ipv4_adds_each_dns_server(self) -> None:
         runner = FakeRunner()
@@ -735,6 +746,30 @@ class WinPEPowerServiceTests(unittest.TestCase):
 
 
 class CommandRunnerTests(unittest.TestCase):
+    def test_streamed_dism_progress_displays_only_percentage(self) -> None:
+        from types import SimpleNamespace
+
+        process = SimpleNamespace(
+            stdout=iter([" [===77%=  ]\n", "[====== 77.5% ===]\n", "The operation completed successfully.\n"]),
+            wait=lambda: 0,
+        )
+        callback_messages: list[str] = []
+        logger = logging.getLogger("test_dism_percentage_only")
+        with mock.patch("winpe_deploy.command_runner.subprocess.Popen", return_value=process), self.assertLogs(logger, level="INFO") as captured:
+            result = CommandRunner(logger).run_streaming(["dism.exe", "/Capture-Image"], output_callback=callback_messages.append)
+        self.assertEqual(["77%", "77.5%", "The operation completed successfully."], callback_messages)
+        self.assertEqual("\n".join(callback_messages), result.stdout)
+        self.assertNotIn("[===", "\n".join(captured.output))
+
+    def test_streamed_other_commands_keep_their_output(self) -> None:
+        from types import SimpleNamespace
+
+        process = SimpleNamespace(stdout=iter(["[===77%=  ]\n"]), wait=lambda: 0)
+        messages: list[str] = []
+        with mock.patch("winpe_deploy.command_runner.subprocess.Popen", return_value=process):
+            CommandRunner(logging.getLogger("test_other_streaming")).run_streaming(["other.exe"], output_callback=messages.append)
+        self.assertEqual(["[===77%=  ]"], messages)
+
     def test_windows_child_processes_use_no_console_window_flag(self) -> None:
         with mock.patch("winpe_deploy.command_runner.os.name", "nt"):
             self.assertEqual({"creationflags": 0x08000000}, CommandRunner._hidden_window_options())

@@ -269,35 +269,64 @@ class StartupPreflightTests(unittest.TestCase):
         self.assertEqual([("Z:", "\\\\server\\deployment", "tech", "secret")], network.share_calls)
         self.assertEqual([10, 10], waits)
 
-    def test_preflight_maps_multiple_partitions_by_disk_serial(self) -> None:
-        with tempfile.TemporaryDirectory() as temporary:
-            root = Path(temporary)
-            content = root / MEDIA_CONTENT_DIR
-            content.mkdir()
-            (content / "startup-config.ini").write_text(
-                "[disk_mapping]\nserial_number = IMAGE-DISK-01\npartition_1 = R:\npartition_3 = S:\n",
-                encoding="utf-8",
-            )
-            deployment = FakeDeploymentService()
-            deployment.map_disk_partitions_by_serial = mock.Mock()
-            run_startup_preflight(roots=[root], deployment=deployment, network=FakeNetworkService(),
-                                  logger=logging.getLogger("test_partition_mapping"), sleeper=lambda _: None)
-        deployment.map_disk_partitions_by_serial.assert_called_once_with("IMAGE-DISK-01", ((1, "R:"), (3, "S:")))
+    def test_source_disk_wim_requires_unique_serial_and_exactly_one_file(self) -> None:
+        from winpe_deploy.startup_config import AutoDeployStartupConfig
+        from winpe_deploy.models import FirmwareType
+        from winpe_deploy.startup_preflight import _resolve_source_wim
 
-    def test_preflight_refuses_mapping_over_startup_media_letter(self) -> None:
-        with tempfile.TemporaryDirectory() as temporary:
-            root = Path(temporary)
-            content = root / MEDIA_CONTENT_DIR
-            content.mkdir()
-            config = content / "startup-config.ini"
-            config.write_text("[disk_mapping]\nserial_number = IMAGE-DISK-01\npartition_1 = R:\n", encoding="utf-8")
-            deployment = FakeDeploymentService()
-            deployment.map_disk_partitions_by_serial = mock.Mock()
-            with mock.patch("winpe_deploy.startup_preflight.Path.drive", new_callable=mock.PropertyMock, return_value="R:"):
-                completed = run_startup_preflight(roots=[root], deployment=deployment, network=FakeNetworkService(),
-                                                  logger=logging.getLogger("test_partition_mapping_protection"), sleeper=lambda _: None)
-        self.assertFalse(completed)
-        deployment.map_disk_partitions_by_serial.assert_not_called()
+        with tempfile.TemporaryDirectory():
+            configuration = AutoDeployStartupConfig("Images\\base.wim", 1, FirmwareType.UEFI, 100, "", source_disk_serial="SOURCE")
+            deployment = mock.Mock()
+            deployment.disk_number_for_drive.return_value = 2
+            disk = DiskInfo(2, "Source", 64 * 1024**3, serial_number="SOURCE", partition_letters=((2, "R:"),))
+            available = {r"R:\Images\base.wim"}
+            def accessible(path: Path) -> bool:
+                return str(path) in available
+
+            with mock.patch("winpe_deploy.startup_preflight.Path.is_file", autospec=True, side_effect=accessible):
+                path, chosen = _resolve_source_wim(configuration, [disk], deployment)
+                self.assertEqual(r"R:\Images\base.wim", path)
+                self.assertEqual(disk, chosen)
+                for disks in ([], [disk, disk]):
+                    with self.assertRaisesRegex(ValueError, "exactly one physical disk"):
+                        _resolve_source_wim(configuration, disks, deployment)
+                two = DiskInfo(2, "Source", 64 * 1024**3, serial_number="SOURCE", partition_letters=((1, "R:"), (2, "S:")))
+                # An unrelated WIM on S: does not affect the exact-path lookup.
+                self.assertEqual(r"R:\Images\base.wim", _resolve_source_wim(configuration, [two], deployment)[0])
+                available.add(r"S:\Images\base.wim")
+                with self.assertRaisesRegex(ValueError, "exactly one accessible WIM"):
+                    _resolve_source_wim(configuration, [two], deployment)
+                available.remove(r"S:\Images\base.wim")
+                deployment.disk_number_for_drive.return_value = 3
+                with self.assertRaisesRegex(ValueError, "does not belong"):
+                    _resolve_source_wim(configuration, [disk], deployment)
+            with self.assertRaisesRegex(ValueError, "exactly one accessible WIM"):
+                _resolve_source_wim(configuration, [disk], deployment)
+
+    def test_source_disk_is_never_selected_for_clean(self) -> None:
+        from winpe_deploy.startup_config import AutoDeployStartupConfig
+        from winpe_deploy.models import FirmwareType
+        from winpe_deploy.startup_preflight import _run_automatic_deployment
+
+        config = AutoDeployStartupConfig("Images\\base.wim", 1, FirmwareType.UEFI, 100, "", source_disk_serial="SOURCE")
+        source = DiskInfo(2, "Image disk", 500 * 1024**3, serial_number="SOURCE", partition_letters=((2, "R:"),))
+        target = DiskInfo(0, "Target", 500 * 1024**3)
+        deployment = mock.Mock()
+        deployment.list_disks_for_auto_deploy.return_value = [source, target]
+        deployment.disk_number_for_drive.return_value = 2
+        deployment.inspect_wim.return_value = [WimImageInfo(1, "Windows", "")]
+        power = FakePowerService()
+        logger = logging.getLogger("test_source_disk_protection")
+        with mock.patch("winpe_deploy.startup_preflight.Path.is_file", return_value=True), mock.patch(
+            "winpe_deploy.startup_preflight._auto_deploy_protected_disk_numbers", return_value={3}
+        ):
+            self.assertTrue(_run_automatic_deployment(Path("C:\\startup-config.ini"), config, deployment, power, logger, FakeNetworkService(), lambda _: None))
+            self.assertEqual(0, deployment.deploy_image.call_args.args[2])
+            self.assertEqual(1, power.restart_calls)
+            deployment.deploy_image.reset_mock()
+            deployment.list_disks_for_auto_deploy.return_value = [source]
+            self.assertFalse(_run_automatic_deployment(Path("C:\\startup-config.ini"), config, deployment, power, logger, FakeNetworkService(), lambda _: None))
+            deployment.deploy_image.assert_not_called()
 
     def test_preflight_deploys_before_gui_when_one_eligible_disk_remains(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:

@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import logging
 import os
+import re
 import subprocess
 from collections.abc import Callable, Mapping, Sequence
 from dataclasses import dataclass
@@ -84,6 +85,11 @@ class CommandRunner:
             message = line.strip()
             if not message:
                 continue
+            if os.path.basename(command_tuple[0]).casefold() == "dism.exe":
+                # DISM renders a console-only bar; keep its percentage for the GUI and logs.
+                bar = re.fullmatch(r"\[=*[ \t]*(\d{1,3}(?:\.\d+)?)\s*%[= \t]*\]", message)
+                if bar:
+                    message = f"{bar.group(1)}%"
             output_lines.append(message)
             self._logger.info("Output from %s: %s", command_tuple[0], message)
             output_callback(message)

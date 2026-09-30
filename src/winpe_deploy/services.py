@@ -78,49 +78,6 @@ class DeploymentService:
             raise RuntimeError(f"Could not resolve {drive} to a physical disk number.") from error
         raise RuntimeError(f"Could not resolve {drive} to a physical disk number using PowerShell or DiskPart.")
 
-    def map_disk_partitions_by_serial(self, serial_number: str, mappings: tuple[tuple[int, str], ...]) -> None:
-        """Assign requested letters to partitions of exactly one serial-matched disk."""
-        serial = serial_number.strip().replace("'", "''")
-        if not serial or not mappings:
-            raise ValueError("A physical disk serial and at least one partition mapping are required.")
-        if any(number < 1 or not re.fullmatch(r"[A-Z]:", letter) for number, letter in mappings):
-            raise ValueError("Partition numbers and drive letters must be valid before mapping.")
-        if len({number for number, _ in mappings}) != len(mappings):
-            raise ValueError("Each partition may be mapped only once.")
-        if len({letter for _, letter in mappings}) != len(mappings):
-            raise ValueError("Each requested drive letter must be unique.")
-        encoded = json.dumps([[number, letter[0]] for number, letter in mappings])
-        script = (
-            "$ErrorActionPreference='Stop'; "
-            "$diskMatches = @(Get-Disk | Where-Object { ([string]$_.SerialNumber).Trim() -eq '" + serial + "' }); "
-            "if ($diskMatches.Count -ne 1) { throw 'Disk serial did not identify exactly one disk.' }; "
-            "$diskNumber = [int]$diskMatches[0].Number; "
-            "$mapping = @(ConvertFrom-Json -InputObject '" + encoded + "'); "
-            "$partitions = @{}; $targetPartitions = @{}; $targetLetters = @{}; "
-            "foreach ($entry in $mapping) { "
-            "$partitionNumber = [int]$entry[0]; $letter = ([string]$entry[1]).ToUpperInvariant(); "
-            "$partitionMatches = @(Get-Partition -DiskNumber $diskNumber -PartitionNumber $partitionNumber -ErrorAction Stop); "
-            "if ($partitionMatches.Count -ne 1) { throw ('Partition ' + $partitionNumber + ' did not resolve uniquely.') }; "
-            "$partition = $partitionMatches[0]; $partitions[[string]$partitionNumber] = $partition; "
-            "$targetPartitions[($diskNumber.ToString() + ':' + $partitionNumber.ToString())] = $true; "
-            "$targetLetters[$letter] = $true; "
-            "if ($partition.DriveLetter -and $partition.DriveLetter.ToString().ToUpperInvariant() -ne $letter) { "
-            "throw ('Partition ' + $partitionNumber + ' already has a different drive letter.') }; "
-            "}; "
-            "foreach ($entry in $mapping) { $partition = $partitions[[string][int]$entry[0]]; "
-            "$letter = ([string]$entry[1]).ToUpperInvariant(); "
-            "$used = @(Get-Partition | Where-Object { $_.DriveLetter -and $_.DriveLetter.ToString().ToUpperInvariant() -eq $letter }); "
-            "foreach ($volume in $used) { $key = ([int]$volume.DiskNumber).ToString() + ':' + ([int]$volume.PartitionNumber).ToString(); "
-            "if (-not $targetPartitions.ContainsKey($key) -or -not $targetLetters.ContainsKey($letter)) { "
-            "throw ('Drive letter ' + $letter + ' is already used by a non-target partition.') } } "
-            "}; "
-            "foreach ($entry in $mapping) { $partition = $partitions[[string][int]$entry[0]]; "
-            "if (-not $partition.DriveLetter) { Add-PartitionAccessPath -InputObject $partition "
-            "-AccessPath (([string]$entry[1]).ToUpperInvariant() + ':\') -ErrorAction Stop } }; "
-            "'Drive mapping completed.'"
-        )
-        self._runner.run(["powershell.exe", "-NoProfile", "-NonInteractive", "-Command", script])
-
     def single_disk_number_for_drive(self, drive_letter: str) -> int:
         """Lock mapping: require DiskPart to report exactly one physical extent."""
         drive = normalize_drive_letter(drive_letter)
@@ -568,11 +525,14 @@ class DeploymentService:
         self._run_diskpart(f"select volume={drive[0]}\r\nlabel=\"{volume_label}\"\r\n")
 
     def create_primary_partition(
-        self, disk_number: int, size_mib: int | None, file_system: str, label: str, drive_letter: str | None
+        self, disk_number: int, size_mib: int | None, file_system: str, label: str, drive_letter: str | None,
+        *, offset_kib: int = 0
     ) -> None:
         self._validate_disk_number(disk_number)
         if size_mib is not None and size_mib < 1:
             raise ValueError("Partition size must be at least 1 MiB, or leave it blank to use all unallocated space.")
+        if isinstance(offset_kib, bool) or not isinstance(offset_kib, int) or offset_kib < 0:
+            raise ValueError("Partition offset must be a non-negative whole number of KiB.")
         filesystem = file_system.strip().upper()
         if filesystem not in {"NTFS", "EXFAT", "FAT32"}:
             raise ValueError("Select NTFS, exFAT, or FAT32.")
@@ -585,9 +545,10 @@ class DeploymentService:
         else:
             assign_command = ""
         size_command = f" size={size_mib}" if size_mib is not None else ""
+        offset_command = f" offset={offset_kib}" if offset_kib else ""
         label_command = f' label="{volume_label}"' if volume_label else ""
         self._run_diskpart(
-            f"select disk {disk_number}\r\ncreate partition primary{size_command}\r\n"
+            f"select disk {disk_number}\r\ncreate partition primary{size_command}{offset_command}\r\n"
             f"format quick fs={filesystem}{label_command}\r\n{assign_command}"
         )
 

@@ -13,7 +13,7 @@ from pathlib import Path
 from tkinter import filedialog, messagebox, simpledialog, ttk
 
 from . import __version__
-from .command_runner import CommandRunner
+from .command_runner import CommandExecutionError, CommandRunner
 from .media_content import MEDIA_CONTENT_DIR
 from .models import (
     CaptureCompression,
@@ -357,11 +357,13 @@ class WinPEImageDeployerApp(tk.Tk):
         ttk.Label(tab, text="Physical Disk and Partition Management", style="Heading.TLabel").grid(row=0, column=0, columnspan=4, sticky=tk.W)
         ttk.Label(tab, text="Manage partition layouts with DiskPart. Clean disk permanently removes every partition; it does not restore a manufacturer's recovery image.", foreground="#9c0006", wraplength=820).grid(row=1, column=0, columnspan=4, sticky=tk.W, pady=(4, 10))
         self.physical_disks: dict[str, int] = {}
+        self.physical_disk_serials: dict[int, str] = {}
         self.physical_partitions: dict[str, int] = {}
         self.physical_resize_volumes: dict[str, str] = {}
         self.physical_disk = tk.StringVar()
         self.physical_partition = tk.StringVar()
         self.physical_create_size = tk.StringVar()
+        self.physical_create_offset = tk.StringVar(value="0")
         self.physical_create_file_system = tk.StringVar(value="NTFS")
         self.physical_create_label = tk.StringVar()
         self.physical_create_letter = tk.StringVar()
@@ -370,6 +372,7 @@ class WinPEImageDeployerApp(tk.Tk):
         self.physical_clean_confirmation = tk.StringVar()
         self.physical_disk_combo = ttk.Combobox(tab, textvariable=self.physical_disk, state="readonly", width=76)
         self.physical_disk_combo.bind("<<ComboboxSelected>>", lambda _: self._refresh_physical_partitions())
+        self.physical_disk_combo.bind("<Button-3>", self._show_physical_disk_menu)
         self._field(tab, 2, "Physical disk:", self.physical_disk_combo, button=("Refresh disks", self._refresh_physical_disks))
         ttk.Label(tab, text="Partitions on selected disk:").grid(row=3, column=0, sticky=tk.NW, pady=(7, 0))
         self.physical_partition_list = tk.Listbox(tab, height=6, exportselection=False)
@@ -381,24 +384,26 @@ class WinPEImageDeployerApp(tk.Tk):
         self._field(tab, 7, "File system:", ttk.Combobox(tab, textvariable=self.physical_create_file_system, values=("NTFS", "exFAT", "FAT32"), state="readonly", width=48))
         self._field(tab, 8, "Label:", ttk.Entry(tab, textvariable=self.physical_create_label, width=52))
         self._field(tab, 9, "Drive letter (optional):", ttk.Entry(tab, textvariable=self.physical_create_letter, width=15), "Example: F:")
-        ttk.Button(tab, text="Create and format partition", command=self._create_physical_partition).grid(row=10, column=1, sticky=tk.W, pady=(4, 10))
-        ttk.Separator(tab).grid(row=11, column=0, columnspan=4, sticky=tk.EW, pady=10)
-        ttk.Label(tab, text="Delete selected partition", style="Heading.TLabel").grid(row=12, column=0, columnspan=4, sticky=tk.W)
-        ttk.Button(tab, text="Delete selected partition", style="Danger.TButton", command=self._delete_physical_partition).grid(row=13, column=1, sticky=tk.W, pady=(5, 10))
-        ttk.Separator(tab).grid(row=14, column=0, columnspan=4, sticky=tk.EW, pady=10)
-        ttk.Label(tab, text="Resize an assigned volume", style="Heading.TLabel").grid(row=15, column=0, columnspan=4, sticky=tk.W)
+        self._field(tab, 10, "Offset (KiB, advanced):", ttk.Entry(tab, textvariable=self.physical_create_offset, width=20),
+                    "0 = automatic; position from disk start for a NEW partition only (does not move existing partitions)")
+        ttk.Button(tab, text="Create and format partition", command=self._create_physical_partition).grid(row=11, column=1, sticky=tk.W, pady=(4, 10))
+        ttk.Separator(tab).grid(row=12, column=0, columnspan=4, sticky=tk.EW, pady=10)
+        ttk.Label(tab, text="Delete selected partition", style="Heading.TLabel").grid(row=13, column=0, columnspan=4, sticky=tk.W)
+        ttk.Button(tab, text="Delete selected partition", style="Danger.TButton", command=self._delete_physical_partition).grid(row=14, column=1, sticky=tk.W, pady=(5, 10))
+        ttk.Separator(tab).grid(row=15, column=0, columnspan=4, sticky=tk.EW, pady=10)
+        ttk.Label(tab, text="Resize an assigned volume", style="Heading.TLabel").grid(row=16, column=0, columnspan=4, sticky=tk.W)
         self.physical_resize_combo = ttk.Combobox(tab, textvariable=self.physical_resize_volume, state="readonly", width=68)
-        self._field(tab, 16, "Volume:", self.physical_resize_combo, button=("Refresh volumes", self._refresh_physical_resize_volumes))
-        self._field(tab, 17, "Size (MiB):", ttk.Entry(tab, textvariable=self.physical_resize_size, width=20), "Shrink requires a size; extend blank uses all contiguous space")
+        self._field(tab, 17, "Volume:", self.physical_resize_combo, button=("Refresh volumes", self._refresh_physical_resize_volumes))
+        self._field(tab, 18, "Size (MiB):", ttk.Entry(tab, textvariable=self.physical_resize_size, width=20), "Shrink requires a size; extend blank uses all contiguous space")
         controls = ttk.Frame(tab)
-        controls.grid(row=18, column=1, sticky=tk.W, pady=(4, 10))
+        controls.grid(row=19, column=1, sticky=tk.W, pady=(4, 10))
         ttk.Button(controls, text="Extend volume", command=lambda: self._resize_physical_volume(extend=True)).pack(side=tk.LEFT)
         ttk.Button(controls, text="Shrink volume", command=lambda: self._resize_physical_volume(extend=False)).pack(side=tk.LEFT, padx=(8, 0))
-        ttk.Separator(tab).grid(row=19, column=0, columnspan=4, sticky=tk.EW, pady=10)
-        ttk.Label(tab, text="Factory reset to an empty disk", style="Heading.TLabel").grid(row=20, column=0, columnspan=4, sticky=tk.W)
-        ttk.Label(tab, text="This runs DiskPart CLEAN: all partitions and data on the selected physical disk are removed. It cannot restore OEM recovery partitions.", foreground="#9c0006", wraplength=820).grid(row=21, column=0, columnspan=4, sticky=tk.W, pady=(4, 4))
-        self._field(tab, 22, "Type selected disk number:", ttk.Entry(tab, textvariable=self.physical_clean_confirmation, width=15), "Required to clean the disk")
-        ttk.Button(tab, text="Clean entire disk", style="Danger.TButton", command=self._clean_physical_disk).grid(row=23, column=1, sticky=tk.W, pady=(4, 0))
+        ttk.Separator(tab).grid(row=20, column=0, columnspan=4, sticky=tk.EW, pady=10)
+        ttk.Label(tab, text="Factory reset to an empty disk", style="Heading.TLabel").grid(row=21, column=0, columnspan=4, sticky=tk.W)
+        ttk.Label(tab, text="This runs DiskPart CLEAN: all partitions and data on the selected physical disk are removed. It cannot restore OEM recovery partitions.", foreground="#9c0006", wraplength=820).grid(row=22, column=0, columnspan=4, sticky=tk.W, pady=(4, 4))
+        self._field(tab, 23, "Type selected disk number:", ttk.Entry(tab, textvariable=self.physical_clean_confirmation, width=15), "Required to clean the disk")
+        ttk.Button(tab, text="Clean entire disk", style="Danger.TButton", command=self._clean_physical_disk).grid(row=24, column=1, sticky=tk.W, pady=(4, 0))
         self._configure_grid(tab)
         tab.rowconfigure(3, weight=1)
         self.after(450, self._refresh_physical_disks)
@@ -721,10 +726,34 @@ class WinPEImageDeployerApp(tk.Tk):
 
     def _set_physical_disks(self, disks: list) -> None:
         self.physical_disks = {disk.display_name(): disk.number for disk in disks}
+        self.physical_disk_serials = {disk.number: disk.serial_number for disk in disks}
         displays = list(self.physical_disks)
         self.physical_disk_combo["values"] = displays
         if displays and self.physical_disk.get() not in self.physical_disks:
             self.physical_disk.set(displays[0])
+        elif not displays:
+            self.physical_disk.set("")
+
+    def _show_physical_disk_menu(self, event: tk.Event) -> None:
+        disk_number = self._selected_physical_disk_number()
+        serial = self.physical_disk_serials.get(disk_number, "").strip()
+        menu = tk.Menu(self.physical_disk_combo, tearoff=False)
+        menu.add_command(
+            label="Copy serial number",
+            state=tk.NORMAL if serial else tk.DISABLED,
+            command=lambda: self._copy_physical_disk_serial(serial),
+        )
+        try:
+            menu.tk_popup(event.x_root, event.y_root)
+        finally:
+            menu.grab_release()
+
+    def _copy_physical_disk_serial(self, serial: str) -> None:
+        if not serial:
+            return
+        self.clipboard_clear()
+        self.clipboard_append(serial)
+        self._status.set("Disk serial number copied to clipboard.")
 
     def _selected_physical_disk_number(self) -> int | None:
         return self.physical_disks.get(self.physical_disk.get())
@@ -772,9 +801,16 @@ class WinPEImageDeployerApp(tk.Tk):
         except ValueError:
             messagebox.showerror("Invalid size", "Enter a whole number of MiB, or leave the size blank.", parent=self)
             return
+        offset_text = self.physical_create_offset.get().strip()
+        if not offset_text.isascii() or not offset_text.isdecimal():
+            messagebox.showerror("Invalid offset", "Enter a non-negative whole number of KiB (0 = automatic).", parent=self)
+            return
+        offset_kib = int(offset_text)
         if not messagebox.askyesno(
             "Create partition",
-            f"Create and format a new primary partition on Disk {disk_number}?\n\nOnly contiguous unallocated space can be used.",
+            f"Create and format a new primary partition on Disk {disk_number}?\n\nOnly contiguous unallocated space can be used."
+            + (f"\nAdvanced: start at offset {offset_kib} KiB from disk start; existing partitions will not move."
+               if offset_kib else "\nOffset: automatic."),
             icon=messagebox.WARNING,
             parent=self,
         ):
@@ -787,6 +823,7 @@ class WinPEImageDeployerApp(tk.Tk):
                 self.physical_create_file_system.get(),
                 self.physical_create_label.get(),
                 self.physical_create_letter.get() or None,
+                offset_kib=offset_kib,
             ),
             on_finished=self._refresh_physical_disk_state_after_operation, disks={disk_number},
         )
@@ -833,10 +870,23 @@ class WinPEImageDeployerApp(tk.Tk):
             return
         self._run_disk_operation(
             f"{action.title()}ing volume",
-            lambda: self._deployment.resize_volume(drive, extend=extend, size_mib=size_mib),
+            lambda: self._resize_volume_with_guidance(drive, extend=extend, size_mib=size_mib),
             drive=drive,
             on_finished=self._refresh_physical_disk_state_after_operation,
         )
+
+    def _resize_volume_with_guidance(self, drive: str, *, extend: bool, size_mib: int | None) -> None:
+        try:
+            self._deployment.resize_volume(drive, extend=extend, size_mib=size_mib)
+        except CommandExecutionError as error:
+            if not extend:
+                raise
+            raise RuntimeError(
+                f"{error}\n\nPossible reason: a basic partition can extend only into unallocated space "
+                "immediately after it on the same disk. Free space behind another partition or free space "
+                "inside a volume does not count. A requested size may also exceed adjacent free space. "
+                "Check partition sizes and offsets before retrying; this tool does not move partitions."
+            ) from error
 
     def _clean_physical_disk(self) -> None:
         disk_number = self._selected_physical_disk_number()
