@@ -97,7 +97,10 @@ class DeploymentService:
             (
                 "$ErrorActionPreference='Stop'; "
                 "$result = foreach ($disk in Get-Disk) { "
-                "$partitions = @(Get-Partition -DiskNumber $disk.Number -ErrorAction Stop); "
+                # Only the specific no-match error on a confirmed empty disk is safe to ignore.
+                "$partitions = @(); try { $partitions = @(Get-Partition -DiskNumber $disk.Number -ErrorAction Stop) } "
+                "catch { if ($_.FullyQualifiedErrorId -ne 'CmdletizationQuery_NotFound_DiskNumber,Get-Partition' "
+                "-or $null -eq $disk.NumberOfPartitions -or $disk.NumberOfPartitions -ne 0) { throw } }; "
                 "$volumes = @($partitions | ForEach-Object { $partition = $_; $volume = $partition | Get-Volume -ErrorAction SilentlyContinue; if ($null -ne $volume -and $null -ne $volume.Size) { $volume } }); "
                 "$volumeSize = [int64](@($volumes | Measure-Object -Property Size -Sum).Sum); "
                 "$volumeFree = [int64](@($volumes | Measure-Object -Property SizeRemaining -Sum).Sum); "
@@ -143,14 +146,28 @@ class DeploymentService:
                 )
                 for item in raw_disks
             ]
-            if any(disk.number < 0 or disk.size_bytes <= 0 for disk in disks):
+            if any(disk.number < 0 or disk.size_bytes < 0 for disk in disks):
                 raise ValueError("Invalid physical disk number or capacity.")
             if len({disk.number for disk in disks}) != len(disks):
                 raise ValueError("Duplicate physical disk numbers.")
             all_letters = [letter for disk in disks for _, letter in disk.partition_letters]
             if len(set(all_letters)) != len(all_letters):
                 raise ValueError("One drive letter is assigned to more than one physical disk.")
-            return disks
+            usable_disks = []
+            for disk, item in zip(disks, raw_disks):
+                if disk.size_bytes == 0:
+                    # A zero-capacity USB reader is not a deployment target. Never
+                    # ignore contradictory or incomplete storage metadata.
+                    if (disk.bus_type.upper() != "USB" or disk.partition_letters
+                            or any(item.get(key) != 0 for key in ("VolumeSize", "VolumeFree", "Unallocated"))):
+                        raise ValueError("Invalid physical disk number or capacity.")
+                    self._logger.warning(
+                        "Skipping zero-capacity USB device Disk %d (%s); no usable media reported.",
+                        disk.number, disk.model,
+                    )
+                    continue
+                usable_disks.append(disk)
+            return usable_disks
         except (CommandExecutionError, json.JSONDecodeError, KeyError, TypeError, ValueError, AttributeError) as error:
             self._logger.error("PowerShell disk discovery failed: %s", error)
             return []

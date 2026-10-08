@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "winpe-image-deployer"
-version = "0.2.5"
+version = "0.2.6"
 description = "A Windows PE GUI utility for capturing, servicing, and deploying Windows WIM images."
 requires-python = "==3.12.*"
 license = { text = "MIT" }

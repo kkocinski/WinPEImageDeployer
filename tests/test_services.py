@@ -215,6 +215,73 @@ class DeploymentServiceTests(unittest.TestCase):
         service = DeploymentService(FakeRunner([json.dumps(disk)]), logging.getLogger("test"))
         self.assertEqual((), service.list_disks()[0].partition_letters)
 
+    def test_auto_deploy_metadata_skips_zero_capacity_usb_reader(self) -> None:
+        disks = [
+            {"Number": 2, "Size": 2000000000000, "BusType": "RAID", "SerialNumber": "TARGET", "Partitions": [{"Number": 3, "Letter": "F:"}]},
+            {"Number": 1, "Size": 30000000000, "BusType": "USB", "SerialNumber": "SOURCE", "Partitions": [{"Number": 1, "Letter": "C:"}]},
+            {"Number": 0, "Size": 0, "BusType": "USB", "FriendlyName": "Empty reader", "Partitions": [], "VolumeSize": 0, "VolumeFree": 0, "Unallocated": 0},
+        ]
+        service = DeploymentService(FakeRunner([json.dumps(disks)]), logging.getLogger("test"))
+        with self.assertLogs("test", level="WARNING") as captured:
+            result = service.list_disks_for_auto_deploy()
+        self.assertEqual([2, 1], [disk.number for disk in result])
+        self.assertEqual(["TARGET", "SOURCE"], [disk.serial_number for disk in result])
+        self.assertIn("Skipping zero-capacity USB device", captured.output[0])
+
+    def test_auto_deploy_rejects_inconsistent_zero_capacity_metadata(self) -> None:
+        base = {"Number": 0, "Size": 0, "BusType": "USB", "Partitions": [], "VolumeSize": 0, "VolumeFree": 0, "Unallocated": 0}
+        for changes in ({"Size": -1}, {"Number": -1}, {"BusType": "NVMe"},
+                        {"VolumeSize": 1}, {"VolumeFree": None}, {"Unallocated": 1},
+                        {"Partitions": [{"Number": 1, "Letter": "C:"}]}):
+            with self.subTest(changes=changes):
+                valid = {"Number": 2, "Size": 100000, "Partitions": []}
+                runner = FakeRunner([json.dumps([valid, dict(base, **changes)])])
+                service = DeploymentService(runner, logging.getLogger("test"))
+                with self.assertRaisesRegex(RuntimeError, "PowerShell disk metadata"):
+                    service.list_disks_for_auto_deploy()
+                self.assertEqual(1, len(runner.commands))
+
+    def test_auto_deploy_rejects_list_containing_only_empty_usb_reader(self) -> None:
+        reader = {"Number": 0, "Size": 0, "BusType": "USB", "Partitions": [], "VolumeSize": 0, "VolumeFree": 0, "Unallocated": 0}
+        service = DeploymentService(FakeRunner([json.dumps(reader)]), logging.getLogger("test"))
+        with self.assertRaisesRegex(RuntimeError, "PowerShell disk metadata"):
+            service.list_disks_for_auto_deploy()
+
+    @unittest.skipUnless(sys.platform == "win32", "Requires Windows PowerShell")
+    def test_disk_discovery_powershell_handles_only_confirmed_empty_disk_no_match(self) -> None:
+        runner = FakeRunner(["[]"])
+        DeploymentService(runner, logging.getLogger("test"))._list_disks_with_powershell()
+        discovery_script = runner.commands[0][0][-1]
+        for count, error_id, expected_success in (
+            (0, "CmdletizationQuery_NotFound_DiskNumber", True),
+            (1, "CmdletizationQuery_NotFound_DiskNumber", False),
+            ("$null", "CmdletizationQuery_NotFound_DiskNumber", False),
+            (0, "StorageAccessDenied", False),
+        ):
+            with self.subTest(count=count, error_id=error_id):
+                # Execute the real discovery script with fake cmdlets, never querying hardware.
+                setup = (
+                    "function Get-Disk { [pscustomobject]@{Number=0;FriendlyName='Empty SSD';"
+                    f"NumberOfPartitions={count};BusType='NVMe';SerialNumber='EMPTY-0';Size=1073741824}} }}; "
+                    "function Get-Partition { [CmdletBinding()]param($DiskNumber); "
+                    "$record = New-Object System.Management.Automation.ErrorRecord "
+                    f"-ArgumentList @((New-Object System.Exception 'mock failure'),'{error_id}',"
+                    "[System.Management.Automation.ErrorCategory]::ObjectNotFound,$DiskNumber); "
+                    "$PSCmdlet.ThrowTerminatingError($record) }; "
+                )
+                result = subprocess.run(
+                    ["powershell.exe", "-NoProfile", "-NonInteractive", "-Command", setup + discovery_script],
+                    capture_output=True, text=True, timeout=30,
+                )
+                if expected_success:
+                    self.assertEqual(0, result.returncode, result.stderr)
+                    disk = json.loads(result.stdout)
+                    self.assertEqual([], disk["Partitions"])
+                    self.assertEqual("EMPTY-0", disk["SerialNumber"])
+                    self.assertEqual(1073741824, disk["Unallocated"])
+                else:
+                    self.assertNotEqual(0, result.returncode)
+
     def test_list_disks_preserves_partition_letters_on_each_physical_disk(self) -> None:
         disks = [
             {"Number": 1, "FriendlyName": "USB", "BusType": "USB", "Size": 64000000000,
